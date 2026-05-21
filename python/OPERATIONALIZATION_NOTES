@@ -1,0 +1,221 @@
+# Operationalization notes: `python.yaml` v0.1
+
+Companion document to `python.yaml`. Records the source-by-source audit: what made it in, what was partial, what was deferred, and why. Useful when readers encounter a Python performance pattern that *feels* like it should be covered but isn't — this is where to look for the rationale.
+
+## Discipline note (read first)
+
+`python.yaml` follows the same provenance discipline as `rust.yaml`:
+
+- Every technique cites a single source URL.
+- No source content is reproduced verbatim; the agent reads the cited URL at runtime when context is needed beyond the technique's own description.
+- Techniques that cannot be grounded in a cited URL are excluded. There is one explicit escape valve — `report_unrecognized_hot_path` — which surfaces unmatched hot paths for human review rather than letting the agent invent ungrounded optimizations.
+
+This differs from the Rust case in one important respect: there is no single Nethercote-equivalent for Python in the open-access space. The spec is composed across multiple sources. Each technique's `source` field identifies which one.
+
+## Source-by-source coverage
+
+### 1. Scientific Python Lectures (CC-BY 4.0)
+
+URL: `https://lectures.scientific-python.org/`
+
+Operationalized 11 techniques, all from §2.4 "Optimizing code" and §2.2 "Advanced NumPy":
+
+| Section | Operationalized as |
+| --- | --- |
+| Optimization workflow | profile_with_cprofile, profile_with_line_profiler, profile_memory_with_tracemalloc |
+| Profiling (cProfile, line_profiler, timeit) | covered by the three above |
+| Algorithmic optimization | use_scipy_linalg_over_numpy_linalg, svd_full_matrices_false_when_partial |
+| Vectorizing for loops | vectorize_python_loops_to_numpy |
+| Broadcasting | use_numpy_broadcasting |
+| In-place operations | use_inplace_ops |
+| Views, not copies | avoid_copies_use_views |
+| Cache effects / contiguous arrays | ensure_contiguous_arrays_for_axis_ops |
+| numexpr for compound expressions | use_numexpr_for_large_array_expressions |
+| Cython escape hatch | mapped to use_cython_with_cdef_types (sourced from pandas docs which is more explicit about the technique) |
+| use_local_var_for_repeated_attribute_lookup | from the broader Scientific Python ecosystem documentation |
+
+**Deferred:** the chapter is short. Most of the chapter's material is reflected; there are no significant deferrals from this source itself.
+
+### 2. pandas official docs — "Enhancing performance" (BSD-3-Clause)
+
+URL: `https://pandas.pydata.org/docs/user_guide/enhancingperf.html`
+
+Operationalized 14 techniques. This is the heaviest source in v0.1 — pandas-specific patterns dominate real-world Python performance work, and the pandas team documents them precisely with measured speedups, so they pass the four criteria cleanly.
+
+| pandas guide section | Operationalized as |
+| --- | --- |
+| Cython basics + Pure Python anti-pattern | avoid_dataframe_apply_axis1 |
+| Using ndarray (Series → numpy in inner loops) | use_to_numpy_for_inner_loops |
+| Declaring C types in Cython | use_cython_with_cdef_types |
+| Disabling boundscheck/wraparound | cython_disable_boundscheck_wraparound |
+| Numba JIT | use_numba_jit_for_numerical_hot_loops |
+| Numba @vectorize | use_numba_vectorize_for_elementwise |
+| pandas Numba engine | use_pandas_engine_numba |
+| pandas.eval() | use_dataframe_eval_for_large_arithmetic |
+| DataFrame.query() | use_dataframe_query_for_filtering |
+
+Additional pandas-sourced techniques from related guides:
+
+| Source page | Operationalized as |
+| --- | --- |
+| `categorical.html` | use_pandas_categorical_for_low_cardinality_strings |
+| `pandas.DataFrame.itertuples` | avoid_pandas_iterrows_use_itertuples |
+| `read_csv` reference | read_csv_with_explicit_dtype |
+| `io.html` chunking | stream_csv_with_iterator |
+| `io.html` pyarrow engine | use_pyarrow_csv_for_large_loads |
+
+**Partial:** the pandas guide's worked example walks through five increasingly-Cythonized variants of one function. The YAML captures the *technique* (cdef types, disable boundscheck) rather than reproducing the example. The agent reads the URL when applying.
+
+**Deferred:** pandas-eval engine internals (parsers, supported syntax exhaustively) — these are reference material, not techniques.
+
+### 3. Python.org Programming FAQ (PSF License)
+
+URL: `https://docs.python.org/3/faq/programming.html`
+
+Operationalized 13 techniques. The Performance section itself is brief, but the FAQ as a whole codifies many idioms ("use stdlib primitives", "use the right data structure") that map to concrete patterns in the collections module, builtins, and standard library.
+
+| FAQ section / principle | Operationalized as |
+| --- | --- |
+| "What is the most efficient way to concatenate many strings?" | string_concat_with_join |
+| "My program is too slow" — algorithmic first | (philosophy embedded in workflow; no separate technique) |
+| "My program is too slow" — right data structure | use_set_for_membership_test, use_collections_deque_for_fifo |
+| "My program is too slow" — use stdlib primitives | use_collections_counter, use_collections_defaultdict, use_dict_get_with_default, use_functools_lru_cache_for_memoization |
+| "My program is too slow" — comprehensions | use_list_comprehension_over_loop_append, use_generator_expression_for_streaming |
+| Schwartzian Transform / sort with key | use_sorted_with_key |
+| __slots__ for immutable instances | use_slots_for_data_classes |
+| (general profiling guidance) | use_timeit_for_microbenchmarks |
+| (re module documentation) | compile_regex_outside_hot_loop |
+
+### 4. Python.org standard library docs (PSF License)
+
+URL: `https://docs.python.org/3/library/`
+
+Operationalized 5 techniques across asyncio, concurrent.futures, multiprocessing, and io modules. These were initially tagged with per-module source IDs but consolidated under `python_org_docs` since they all live under the same root.
+
+| Module | Operationalized as |
+| --- | --- |
+| asyncio | use_asyncio_gather_for_concurrent_io, use_create_task_for_fire_and_forget |
+| concurrent.futures | use_concurrent_futures_threadpool_for_io_bound |
+| multiprocessing | use_multiprocessing_for_cpu_bound |
+| io | use_buffered_io_for_byte_streams |
+
+**Deferred (concurrency module):**
+
+- *Thread synchronization primitives* (Lock, Semaphore, Event) — these are correctness tools, not performance techniques.
+- *asyncio queue internals* — protocol-level, no mechanical detection pattern.
+- *Free-threaded Python 3.13+ patterns* — interpreter is still experimental; ecosystem not ready. Revisit in v0.2.
+
+### 5. PEPs 498 and 572 (open)
+
+Two PEPs cited for specific syntax features whose performance characteristics are documented in the PEP itself:
+
+- PEP 498 (f-strings) → use_f_strings_over_format
+- PEP 572 (walrus operator) → use_walrus_to_avoid_recomputation
+
+### 6. NumPy official docs (BSD-3-Clause)
+
+URL: `https://numpy.org/doc/stable/`
+
+Operationalized 2 techniques covering dtype hygiene:
+
+- avoid_object_dtype_use_native
+- use_appropriate_numpy_dtype
+
+Most numpy performance material is also covered by Scientific Python Lectures with more pedagogical framing; NumPy's own docs are cited where the official reference is the cleaner provenance.
+
+### 7. Rougier — *From Python to NumPy* (CC-BY-NC-SA 4.0)
+
+URL: `https://www.labri.fr/perso/nrougier/from-python-to-numpy/`
+
+Operationalized 2 techniques where Rougier's framing is uniquely clear:
+
+- avoid_copies_use_views — chapter "Anatomy of an array > Views and copies"
+- vectorize_random_walks_with_cumsum — chapter "Code vectorization", drawing on the random walk example
+
+**License note:** Rougier's text is CC-BY-NC-SA. The YAML cites it but does not reproduce content; the agent reads the URL at runtime. Per the discipline note above, this is a reference-only relationship and does not invoke the NC clause's restrictions on redistribution.
+
+**Deferred from Rougier:**
+
+- *Problem vectorization* (rethinking the algorithm — path finding, fluid dynamics, blue noise) — architectural; cannot be mechanically detected. These are exemplars of judgment-heavy redesigns, not patterns. Captured indirectly via `report_unrecognized_hot_path`.
+- *Typed list and memory-aware array* (chapter "Custom vectorization") — niche; only relevant when building custom dtype-aware containers. Skipped.
+- *Beyond NumPy* (numpy & co, scipy & co) — survey of the ecosystem, not techniques.
+
+## Notable scope decisions
+
+### Distinct from Rust
+
+Python performance differs structurally from Rust performance in ways that shape this spec:
+
+1. **No build-configuration dimension.** Rust has cargo profile flags, LTO, codegen-units — significant mechanical wins. Python has no analog. The closest is `python -O` (asserts off) and pyc bytecode caching, both negligible and already on by default in production.
+
+2. **Compile-time dimension is small.** Only relevant when Cython/Numba are in play. Most Python projects never compile anything. Hence the 0.05 weight.
+
+3. **Allocations are harder to count.** Python has no equivalent of `dhat` or per-allocation tracking via the allocator interface. `tracemalloc` is the official tool but is sampling-based and adds overhead. Allocations are weighted (0.15) but with looser tolerance (10%).
+
+4. **Latency dominates more heavily.** Without the build-time and binary-size axes that the Rust spec uses, latency takes a larger share of the weight (0.45 vs Rust's 0.30).
+
+5. **Import-time matters.** Python's cold start can be a real concern for CLI tools and Lambda functions. Added as a dimension (0.10); has no Rust analog.
+
+### Techniques considered and explicitly excluded
+
+The following were considered as candidates but excluded with reason. Future readers should not assume their absence is an oversight.
+
+| Candidate | Reason excluded |
+| --- | --- |
+| Replace `dict` with `frozendict` for read-only data | No stdlib `frozendict`; third-party. Not authoritative. |
+| Use `array.array` instead of `list` for homogeneous numeric | Almost always wrong: numpy is the right answer; `array.array` is a half-step. |
+| Avoid `try/except` in hot paths | False generalization. Python try/except has zero cost on the non-exception path; the cost is in raising. Excluded to avoid encouraging EAFP-vs-LBYL confusion. |
+| Use `if ... else ...` ternary over multi-line if/else | Style, not performance. |
+| Replace `f"{x}"` with `str(x)` for single-value conversion | Marginal at best; not documented as a performance technique anywhere authoritative. |
+| Replace recursion with iteration | Architectural; cannot be mechanically detected and applied correctly in general. |
+| Inline functions to reduce call overhead | Same — function-call cost is real in Python but inlining is a judgment call; captured implicitly by `use_local_var_for_repeated_attribute_lookup` for the related method-lookup case. |
+| `__del__` performance considerations | Niche; documented but not a frequently-applicable optimization. |
+| Use uvloop instead of asyncio's default loop | Architectural runtime swap; not a code change. |
+| Switch to PyPy / GraalPy | Interpreter swap, not user-code change. Documented as out-of-scope under `scope_excluded.examples`. |
+| Profile-Guided Optimization for CPython | Targets the interpreter, not user code. |
+
+### Stretch — why some techniques are at the edge
+
+A few techniques in v0.1 are admitted at lower confidence because the Python ecosystem treats them as well-known optimizations even though the *detection* criterion is less crisp than I'd like:
+
+- **use_local_var_for_repeated_attribute_lookup** (medium): mechanical to detect, but only worthwhile in genuinely hot loops. Detection requires a profile-derived iteration count threshold.
+- **use_appropriate_numpy_dtype** (low, consent-required): mechanical to detect, but downcast safety depends on value-range analysis that only the developer can fully validate.
+- **use_pyarrow_csv_for_large_loads** (medium, consent-required): clean substitution but adds a heavy dependency.
+- **stream_csv_with_iterator** (low, consent-required): the *trigger* is mechanical (large file, peak_memory dominated by load), but the rewrite is non-mechanical — downstream code must accept chunked input.
+
+These are honestly labelled. The composite scoring + consent gates mean they don't get applied silently.
+
+## Distribution summary
+
+50 techniques total.
+
+By confidence:
+- **high**: 24 (48%) — mechanical detection, mechanical action, verifiable improvement
+- **medium**: 20 (40%) — some judgment in detection or action, but still grounded
+- **low**: 6 (12%) — architectural or value-range-dependent; all `requires_human_consent: true`
+
+By source:
+- pandas_docs: 14 (28%)
+- python_org_faq: 13 (26%)
+- scientific_python_lectures: 11 (22%)
+- python_org_docs (stdlib): 5 (10%)
+- numpy_docs: 2 (4%)
+- rougier_from_python_to_numpy: 2 (4%)
+- python_org_pep498: 1 (2%)
+- python_org_pep572: 1 (2%)
+- transmute_methodology: 1 (2%)
+
+By consent gate:
+- 13 techniques (26%) require human consent, vs 18% in `rust.yaml`. The higher rate reflects Python's larger fraction of architectural patterns (Cython/Numba/multiprocessing/asyncio rewrites) compared to Rust's more-mechanical landscape.
+
+Composite improvement expectations: lower per-iteration than `rust.yaml`. Most Python optimizations are 10–30% wins on hot paths rather than the order-of-magnitude wins common with Rust build-configuration changes. The improvement threshold (0.005 composite) reflects this — small gains compound across iterations.
+
+## v0.2 candidates
+
+After first validation against a real Python codebase, the following are likely additions:
+
+- **Free-threaded Python 3.13+ patterns** — once the ecosystem stabilizes. Likely a new dimension (`gil_held_pct` or similar) and several techniques.
+- **GPU-accelerated paths** — CuPy / JAX / Torch CUDA. Likely a separate `python-gpu.yaml` per the substrate-orthogonal axis principle.
+- **Polars as a pandas alternative** — currently excluded as wholesale-replacement architectural. If a `polars-migration.yaml` is desired, that's its own provenance.
+- **Type-driven optimizations** — once a body of techniques accumulates from the typed-Python community (mypyc, etc.), add as a new source.
+- **Refinement of `requires_human_consent` gates** after first validation reveals which low-confidence techniques the agent actually proposes vs which ones go untriggered.
