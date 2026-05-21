@@ -1,0 +1,1565 @@
+# Transmute optimization spec: Python
+#
+# Composed from multiple open-licensed authoritative sources.
+# Each technique cites its source URL. No source content is reproduced;
+# techniques are referenced by name and the agent reads the cited URL at runtime.
+#
+# Schema: see SCHEMA_REFERENCE.md in the repo root.
+
+schema_version: "0.1.0"
+language: "python"
+spec_id: "python.yaml"
+revision: "v0.1"
+
+# -----------------------------------------------------------------------------
+# Target — toolchain assumed by this spec
+# -----------------------------------------------------------------------------
+target:
+  runtime: "cpython"
+  min_version: "3.10"
+  recommended_version: "3.12"  # specializing adaptive interpreter mature; free-threaded build available but not assumed
+  package_manager:
+    primary: "pip"
+    alternatives: ["uv", "poetry"]
+  test_command: "pytest -x -q"
+  benchmark_command: "pytest --benchmark-only --benchmark-columns=mean,stddev,median"
+  type_check_command: "mypy --strict ."     # optional; skipped if no mypy config
+  lint_command: "ruff check ."              # ruff is the assumed linter
+  profilers:
+    cpu_deterministic: "cProfile"
+    cpu_line_level: "line_profiler"          # requires `pip install line_profiler`
+    cpu_sampling: "py-spy"                   # requires `pip install py-spy`
+    memory: "memory_profiler"                # requires `pip install memory_profiler`
+    composite: "scalene"                     # requires `pip install scalene`; line+mem+GPU
+  build_artifacts: []  # interpreted; no build step unless Cython/Numba in play
+
+# -----------------------------------------------------------------------------
+# Contracts — what must hold before and after every change
+# -----------------------------------------------------------------------------
+contracts:
+  tests:
+    - id: "unit_tests_pass"
+      command: "pytest -x -q"
+      on_failure: "revert"
+      description: "All unit tests must pass after every applied technique."
+
+  benchmarks:
+    - id: "benchmark_suite_no_regression"
+      command: "pytest --benchmark-only --benchmark-compare=baseline --benchmark-compare-fail=mean:5%"
+      on_failure: "revert"
+      description: "No benchmark regresses by more than 5% on mean latency."
+      requires: "pytest-benchmark installed; baseline saved as `baseline`"
+
+  invariants:
+    - id: "no_new_imports_outside_pyproject"
+      check: "new imports must already appear in pyproject.toml / requirements.txt or be added to it in the same diff"
+      on_failure: "revert"
+
+    - id: "no_top_level_side_effects_introduced"
+      check: "no new I/O, network, or mutation at module top level"
+      on_failure: "revert"
+
+    - id: "type_check_does_not_regress"
+      check: "if mypy passes pre-change, it must pass post-change"
+      on_failure: "revert"
+      condition: "mypy config exists"
+
+  behavior:
+    - id: "public_api_signatures_stable"
+      check: "no change to signatures of functions/classes exported by package __init__.py"
+      on_failure: "revert"
+      exception: "allowed if change is purely additive (new optional param with default)"
+
+# -----------------------------------------------------------------------------
+# Dimensions — what to optimize, weighted
+# -----------------------------------------------------------------------------
+dimensions:
+  - name: "latency_p50"
+    description: "Median wall-clock time of the benchmark suite"
+    weight: 0.45
+    measurement: "pytest-benchmark median across runs"
+    regression_tolerance_pct: 5.0
+
+  - name: "peak_memory"
+    description: "Resident set size peak during benchmark execution"
+    weight: 0.20
+    measurement: "memory_profiler mprof run"
+    regression_tolerance_pct: 5.0
+
+  - name: "allocations"
+    description: "Cumulative object allocations (when measurable via tracemalloc snapshots)"
+    weight: 0.15
+    measurement: "tracemalloc peak allocation diff"
+    regression_tolerance_pct: 10.0
+
+  - name: "import_time"
+    description: "Cold-start import time of the package"
+    weight: 0.10
+    measurement: "python -X importtime -c 'import <pkg>' parsed for total"
+    regression_tolerance_pct: 10.0
+
+  - name: "loc"
+    description: "Source lines of code in the changed files (proxy for maintenance cost)"
+    weight: 0.05
+    measurement: "tokei or cloc on changed paths"
+    regression_tolerance_pct: 25.0
+
+  - name: "compile_time"
+    description: "Wheel build / Cython / Numba JIT warm-up time (only relevant if compiled extensions in play)"
+    weight: 0.05
+    measurement: "time to first run of compiled code"
+    regression_tolerance_pct: 50.0
+
+composite_scoring:
+  method: "weighted_sum_of_normalized_deltas"
+  improvement_threshold: 0.005  # 0.5% composite improvement required to keep a change
+  per_dimension_tolerance: 0.05 # any single dim regressing more than 5% triggers revert regardless of composite
+
+# -----------------------------------------------------------------------------
+# Techniques — the catalog
+# -----------------------------------------------------------------------------
+techniques:
+
+  # ---------------------------------------------------------------------------
+  # Workflow / profiling (4) — from Scientific Python Lectures §2.4 and python.org FAQ
+  # ---------------------------------------------------------------------------
+
+  - id: "profile_with_cprofile"
+    name: "Use cProfile to identify hot functions"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html"
+    description: |
+      Before any change, run cProfile on a representative workload to identify
+      the small number of functions consuming most wall-clock time. Optimize
+      only those.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: "Run `python -m cProfile -o profile.out <entry>` against a representative benchmark."
+    action:
+      type: "report_only"
+      instructions: "Output a ranked list of functions by cumulative time. Subsequent techniques target only the top decile."
+    verify:
+      method: "n/a"
+      criteria: "informational — gates which techniques to apply"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+    notes: "Pre-flight technique; runs once before iteration begins."
+
+  - id: "profile_with_line_profiler"
+    name: "Line-level profiling of hot functions"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html"
+    description: |
+      Once cProfile narrows the search to specific functions, decorate them
+      with @profile and run line_profiler / kernprof to find the exact lines
+      consuming time.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: "Decorate the top function from cProfile with @profile, run `kernprof -l -v <entry>`."
+    action:
+      type: "report_only"
+      instructions: "Output line-by-line timings for the hot function. Subsequent techniques target only those lines."
+    verify:
+      method: "n/a"
+      criteria: "informational"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "use_timeit_for_microbenchmarks"
+    name: "Use timeit for elementary-operation comparisons"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      When deciding between two implementations of a small operation, use timeit
+      rather than wall-clock printf timing. Documented as the canonical method
+      for such comparisons.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: "When the agent considers two alternative implementations, run both under `timeit` and pick the faster."
+    action:
+      type: "report_only"
+      instructions: "Record the relative speedup as evidence for the proposed change."
+    verify:
+      method: "n/a"
+      criteria: "informational"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "profile_memory_with_tracemalloc"
+    name: "Use tracemalloc for allocation profiling"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html"
+    description: |
+      For memory-targeted optimizations, take tracemalloc snapshots around the
+      hot region to identify which lines allocate the most.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: "tracemalloc.start(), run workload, tracemalloc.take_snapshot() and compare."
+    action:
+      type: "report_only"
+      instructions: "Output top allocating lines."
+    verify:
+      method: "n/a"
+      criteria: "informational"
+    targets: ["allocations", "peak_memory"]
+    confidence: "high"
+    tradeoffs: []
+
+  # ---------------------------------------------------------------------------
+  # Core Python idioms (15) — from python.org docs, FAQ, and Scientific Python Lectures
+  # ---------------------------------------------------------------------------
+
+  - id: "string_concat_with_join"
+    name: "Use str.join() to concatenate many strings"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#what-is-the-most-efficient-way-to-concatenate-many-strings-together"
+    description: |
+      The canonical Python answer for concatenating many strings in a loop:
+      build a list and call str.join() once, rather than `result += s` in a loop.
+      Documented directly in the official Programming FAQ.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find AugAssign nodes where target is a Name of type str (or annotated
+        str) and op is Add, inside a for/while loop body. Also match string
+        accumulators like `s = s + x` in loops.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace the loop+= pattern with: build a list `parts = []` before the
+        loop, replace `result += s` with `parts.append(s)`, then `result = "".join(parts)` after the loop. Preserve any intervening operations on `result`
+        inside the loop (if any exist, mark technique inapplicable to that site).
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path containing this loop"
+    targets: ["latency_p50", "allocations"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "use_list_comprehension_over_loop_append"
+    name: "Use list comprehension instead of loop+append"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      Building a list with a comprehension is faster than initializing an empty
+      list and appending in a loop, because the comprehension bypasses the
+      method-lookup overhead of .append() on each iteration.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Match: assignment `name = []` followed by a for-loop whose body is
+        exactly `name.append(<expr>)`, with no other statements in the loop.
+        Also allow `name.append(f(x))` where f is pure.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace with `name = [<expr> for <target> in <iter>]`. If the loop has a
+        conditional (`if pred: name.append(...)`), use the comprehension form
+        `[<expr> for <target> in <iter> if <pred>]`.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path"
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs:
+      - "Slightly higher peak memory if comprehension materializes a large list — see use_generator_expression_for_streaming for the alternative."
+
+  - id: "use_generator_expression_for_streaming"
+    name: "Use generator expression when consumer is streaming"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      When a sequence is consumed once by a function like sum(), any(), all(),
+      max(), min(), or a for loop, use a generator expression (parens) rather
+      than a list comprehension (brackets) to avoid materializing the full list.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find Call nodes whose func is one of {sum, any, all, max, min, set, dict,
+        tuple, "".join, sorted} and whose single positional arg is a ListComp.
+    action:
+      type: "ast_modification"
+      instructions: "Replace the ListComp with the equivalent GeneratorExp (parens instead of brackets)."
+    verify:
+      method: "memory_delta"
+      criteria: "peak_memory does not regress; latency_p50 typically unchanged or slightly improved"
+    targets: ["peak_memory", "allocations"]
+    confidence: "high"
+    tradeoffs:
+      - "If the comprehension is consumed multiple times, must remain a list."
+
+  - id: "use_set_for_membership_test"
+    name: "Use set for membership tests in hot paths"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      `x in some_list` is O(n); `x in some_set` is O(1) average. When a
+      collection is used only for membership tests inside a loop, convert it
+      to a set once outside the loop.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find Compare nodes with op `In` whose comparator is a Name bound to a
+        list literal/list type, and which appear inside a for/while loop body.
+        Exclude cases where the list is mutated (`.append`, `.remove`) inside
+        the same scope.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Either: (a) change the binding to a set literal where the list is
+        constructed, or (b) hoist `name_set = set(name)` to just outside the
+        loop and use `x in name_set` inside. Prefer (a) if no order-dependent
+        operations on the collection exist.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "Sets are unordered. If iteration order matters, keep the list and create a set alongside."
+
+  - id: "use_dict_get_with_default"
+    name: "Use dict.get(key, default) over try/except KeyError"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      Standard-library primitives are typically faster than custom alternatives.
+      `dict.get(key, default)` is faster than the equivalent try/except
+      KeyError pattern in hot paths.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Match try blocks whose body is exactly `value = d[key]` and whose
+        except clause is KeyError handling that assigns a default to `value`.
+    action:
+      type: "ast_modification"
+      instructions: "Replace with `value = d.get(key, default)`."
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path; behavior is preserved when default is None or a fresh literal"
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs:
+      - "If default is an expensive expression, .get() always evaluates it; use a separate `if key in d` check or `defaultdict` instead."
+
+  - id: "use_collections_defaultdict"
+    name: "Use collections.defaultdict instead of dict.setdefault in loops"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      For grouping/accumulation patterns, defaultdict is faster than calling
+      .setdefault() on a regular dict inside a loop, and faster than try/except.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find loops whose body contains `d.setdefault(k, <factory>).append(v)` or
+        the try/except KeyError equivalent with initialization-on-miss.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Change the binding of `d` to `collections.defaultdict(<factory>)` and
+        replace `d.setdefault(k, <factory>).append(v)` with `d[k].append(v)`.
+        Add `from collections import defaultdict` import if missing.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path"
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs:
+      - "defaultdict has subtly different semantics: reads of missing keys *create* entries. Don't apply if code relies on KeyError signaling absence."
+
+  - id: "use_collections_counter"
+    name: "Use collections.Counter for counting"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      Documented stdlib primitive. Counter(iterable) is faster than manual
+      dict-increment loops and is implemented in C.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find: `counts = {}` followed by a loop with `counts[k] = counts.get(k, 0) + 1` or `if k in counts: counts[k] += 1; else: counts[k] = 1`.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace with `counts = collections.Counter(<iterable>)`. If the counting
+        is conditional, use `Counter(k for k in <iter> if <pred>)`.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path"
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "use_collections_deque_for_fifo"
+    name: "Use collections.deque for FIFO queue operations"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      list.pop(0) is O(n); deque.popleft() is O(1). Same for left-side appends.
+      For any queue or sliding-window pattern, deque is the documented
+      stdlib answer.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find Call nodes `name.pop(0)` or `name.insert(0, ...)` where name is
+        bound to a list, anywhere (loops or not — these are cheap to detect).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Change the binding to `collections.deque(...)` and replace `.pop(0)` with `.popleft()`, `.insert(0, x)` with `.appendleft(x)`. Add the import.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; check that no code relies on slicing or non-end indexing of the collection"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "deque does not support O(1) middle indexing. If the code accesses arbitrary indices, do not apply."
+
+  - id: "use_functools_lru_cache_for_memoization"
+    name: "Use functools.lru_cache for pure function memoization"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#my-program-is-too-slow-how-do-i-speed-it-up"
+    description: |
+      For functions that are pure (deterministic given args, no side effects)
+      and called repeatedly with overlapping args, @functools.lru_cache is
+      faster and clearer than a manual dict-cache pattern.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find functions whose first statement checks a module-level dict
+        keyed by the args and returns the cached value if present, otherwise
+        computes and stores. Confirm no other side effects in the function.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Remove the manual cache; decorate the function with
+        `@functools.lru_cache(maxsize=None)` (or a sensible bound). Add import.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; memory usage may increase"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Cache grows unbounded with maxsize=None. Set a maxsize if args have unbounded cardinality."
+      - "Args must be hashable. If function takes lists/dicts, must refactor."
+
+  - id: "use_local_var_for_repeated_attribute_lookup"
+    name: "Hoist repeated attribute lookup to local variable in hot loop"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html"
+    description: |
+      In CPython, name resolution for `obj.attr` is slower than a local-variable
+      read. In tight loops calling `obj.method(...)` repeatedly, bind
+      `m = obj.method` once before the loop and call `m(...)` inside.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Inside a for/while loop body, find Call nodes whose `func` is an
+        Attribute access on the same Name across multiple iterations and where
+        that Name is not reassigned in the loop. Threshold: at least 100
+        observed iterations (from profile) or static loop bound >= 1000.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Before the loop, insert `m = obj.method`. Replace `obj.method(...)` calls inside the loop with `m(...)`.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; otherwise revert (micro-optimization with cost)"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Reduces readability. Only apply when profiling shows the loop is hot."
+
+  - id: "use_sorted_with_key"
+    name: "Use sorted(... key=...) over Decorate-Sort-Undecorate or sort+cmp"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#i-want-to-do-a-complicated-sort-can-you-do-a-schwartzian-transform-in-python"
+    description: |
+      The `key=` argument to sorted/list.sort is the canonical way and is
+      faster than building (key, item) tuples manually or using cmp_to_key.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find sorted/sort calls preceded by manual decorate (list of tuples) +
+        sort + undecorate (list comprehension extracting second element).
+        Also find `sorted(..., cmp=...)` or `cmp_to_key` usage.
+    action:
+      type: "ast_modification"
+      instructions: "Inline the decoration as the `key=` argument: `sorted(items, key=lambda x: <key_expr>)`."
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; loc decreases"
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "use_slots_for_data_classes"
+    name: "Use __slots__ for classes with fixed attribute sets"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/faq/programming.html#how-can-a-subclass-control-what-data-is-stored-in-an-immutable-instance"
+    description: |
+      Adding __slots__ removes the per-instance __dict__, reducing memory and
+      speeding up attribute access. Documented technique; safe for classes
+      that don't need dynamic attributes.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find class definitions where: (a) all attribute assignments to self
+        occur in __init__, (b) no `setattr(self, ...)` with dynamic name,
+        (c) no usage of __dict__, (d) instance count from profiling is high
+        (>= 1000) or the class is declared a dataclass.
+    action:
+      type: "ast_modification"
+      instructions: |
+        For dataclass: change to `@dataclass(slots=True)` (3.10+). Otherwise
+        add `__slots__ = ("attr1", "attr2", ...)` listing exactly the attrs
+        assigned in __init__.
+    verify:
+      method: "memory_delta"
+      criteria: "peak_memory improves; tests pass; latency typically unchanged or slightly improved"
+    targets: ["peak_memory", "allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Breaks pickling for some legacy patterns. Breaks multiple inheritance with non-slotted classes."
+      - "Subclasses must also define __slots__ to retain the memory benefit."
+    requires_human_consent: false
+
+  - id: "compile_regex_outside_hot_loop"
+    name: "Hoist re.compile out of hot loops"
+    source: "python_org_faq"
+    source_url: "https://docs.python.org/3/library/re.html#re.compile"
+    description: |
+      Calling re.search/re.match/re.sub with a string pattern inside a loop
+      re-parses the pattern on each call (the internal cache helps but doesn't
+      eliminate overhead). Pre-compile with re.compile() once.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Inside loop bodies, find calls to re.{search,match,sub,findall,split}
+        whose first argument is a string literal or a Name not bound to a
+        compiled Pattern.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Add `_PATTERN_NAME = re.compile(<pattern>)` at module level (or just
+        above the function). Replace the in-loop call with the method on the
+        compiled pattern: `_PATTERN_NAME.search(text)` etc.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "Pattern becomes module-level state. Naming convention `_<NAME>_PATTERN` keeps it private."
+
+  - id: "use_f_strings_over_format"
+    name: "Use f-strings over .format() and % formatting"
+    source: "python_org_pep498"
+    source_url: "https://peps.python.org/pep-0498/"
+    description: |
+      f-strings are evaluated at parse time into bytecode operations and are
+      faster than str.format() or %-formatting. PEP 498 documents this as the
+      preferred form.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find Call nodes `"<template>".format(...)` and BinOp nodes with
+        `"<template>" %` where the template uses %s/%d/%r placeholders.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Convert to f-string with the corresponding interpolation slots. Skip
+        cases where the template is loaded from config (not a string literal).
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the hot path; tests pass"
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs:
+      - "Cannot translate format strings whose template is dynamic / not a literal."
+
+  - id: "use_walrus_to_avoid_recomputation"
+    name: "Use walrus operator (:=) to avoid recomputing in comprehensions"
+    source: "python_org_pep572"
+    source_url: "https://peps.python.org/pep-0572/"
+    description: |
+      In comprehensions with a filter and a transform that share a sub-expression,
+      use := to compute the sub-expression once per iteration instead of twice.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find comprehensions where the same sub-expression appears in both the
+        `if` clause and the element expression.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Bind the sub-expression with `(name := <expr>)` in the if clause and
+        refer to `name` in the element expression.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves when the sub-expression is non-trivial"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Only worth it when sub-expression is expensive (function call, attribute walk). Pure arithmetic doesn't benefit."
+
+  # ---------------------------------------------------------------------------
+  # NumPy / numerical (11) — from Scientific Python Lectures and Rougier
+  # ---------------------------------------------------------------------------
+
+  - id: "vectorize_python_loops_to_numpy"
+    name: "Replace Python for-loops over arrays with numpy ufuncs"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#writing-faster-numerical-code"
+    description: |
+      The single largest win in numerical Python: replace `for i in range(n): a[i] = f(b[i])` with the equivalent numpy ufunc / array expression operating on the whole array at C speed.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find for loops whose iterator is `range(len(<arr>))` or `range(<arr>.shape[0])` and whose body is a single indexed assignment `a[i] = <expr involving b[i]>` where the operations on b[i] map to numpy ufuncs (arithmetic, np.sin/cos/exp, comparison).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace the loop with `a[:] = <expr>` using whole-array operations.
+        Preserve dtype with explicit `np.asarray(..., dtype=a.dtype)` if needed.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially (typically 10-100x); allocation count drops"
+    targets: ["latency_p50", "allocations"]
+    confidence: "high"
+    tradeoffs:
+      - "Vectorization may increase peak memory if intermediate arrays are large; see use_inplace_ops for the fix."
+
+  - id: "use_numpy_broadcasting"
+    name: "Use broadcasting instead of manual array replication"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#writing-faster-numerical-code"
+    description: |
+      Where two arrays of different shapes need to combine, broadcasting
+      avoids explicit tile/repeat allocations.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find calls to `np.tile`, `np.repeat`, or `np.broadcast_to` followed by an arithmetic op whose result discards the replicated copy.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Remove the tile/repeat; rely on numpy's broadcasting. Use `np.newaxis` or `None` for reshaping where needed to align axes.
+    verify:
+      method: "benchmark_delta"
+      criteria: "peak_memory and allocations decrease; latency_p50 typically improves"
+    targets: ["peak_memory", "allocations", "latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "use_inplace_ops"
+    name: "Use in-place numpy operators where the array is rebound"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#writing-faster-numerical-code"
+    description: |
+      `a *= 0` mutates in place; `a = 0 * a` allocates a new array. When the
+      old binding is not reused, prefer the augmented assignment.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `name = <scalar_or_array> <op> name` or `name = name <op> <expr>` where `name` is a numpy ndarray and the original `name` is not referenced elsewhere between this point and the next reassignment.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace with the augmented assignment `name <op>= <expr>`. For functions that don't have augmented forms (np.exp, np.log, etc.), use the `out=` parameter: `np.exp(a, out=a)`.
+    verify:
+      method: "memory_delta"
+      criteria: "allocations decrease; peak_memory improves; latency improves on large arrays"
+    targets: ["allocations", "peak_memory", "latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "Do not apply if any other reference to the array exists — the mutation will be visible there."
+
+  - id: "avoid_copies_use_views"
+    name: "Use views instead of copies for array slicing"
+    source: "rougier_from_python_to_numpy"
+    source_url: "https://www.labri.fr/perso/nrougier/from-python-to-numpy/#views-and-copies"
+    description: |
+      Slicing a numpy array returns a view by default; explicit `.copy()` calls
+      should be examined and removed where the downstream code does not mutate
+      the slice in ways that should not affect the original.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `<arr>[<slice>].copy()` patterns where the result is consumed
+        read-only or used as input to a function that doesn't mutate its input.
+    action:
+      type: "ast_modification"
+      instructions: "Remove the .copy() call. Verify with tests that no caller mutates the slice."
+    verify:
+      method: "memory_delta"
+      criteria: "allocations decrease; behavior preserved"
+    targets: ["allocations", "peak_memory", "latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "If downstream code does mutate the slice, removing .copy() will corrupt the original. Must verify with tests."
+    requires_human_consent: false
+
+  - id: "ensure_contiguous_arrays_for_axis_ops"
+    name: "Ensure C-contiguous layout matches axis access pattern"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#writing-faster-numerical-code"
+    description: |
+      Reductions along an axis are much faster when the data along that axis is
+      contiguous in memory. C-order arrays have contiguous rows (last axis);
+      F-order arrays have contiguous columns.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `arr.sum(axis=N)` or similar reductions in hot paths where arr is
+        not contiguous along axis N. Check via `arr.flags.c_contiguous` /
+        `arr.flags.f_contiguous` and `arr.strides`.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Either: (a) construct the array in the matching order from the start
+        (np.zeros(shape, order='C') or order='F'), or (b) for hot reductions
+        only, insert `arr = np.ascontiguousarray(arr.T).T` to make rows of T
+        contiguous. Trade copy cost against repeated reduction cost.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially on the reduction; check total time including any one-time reorder"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "One-time reorder may not pay back if the array is used only once."
+
+  - id: "use_scipy_linalg_over_numpy_linalg"
+    name: "Prefer scipy.linalg over numpy.linalg for richer routines"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#example-of-the-svd"
+    description: |
+      scipy.linalg exposes more LAPACK routines and tuning flags than numpy.linalg, often allowing significantly faster operation for the same logical task.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find calls to `np.linalg.svd`, `np.linalg.eig`, `np.linalg.solve` etc. where the equivalent scipy.linalg call accepts additional tuning parameters (full_matrices, overwrite_a, check_finite).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Change import to `from scipy import linalg` and update the call. For SVD with partial output needs, pass `full_matrices=False`. For repeated solves with the same matrix, factor once with `lu_factor` and call `lu_solve` in the loop.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; verify numerical equivalence with np.allclose"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Adds scipy as a dependency if not already present."
+
+  - id: "svd_full_matrices_false_when_partial"
+    name: "Use full_matrices=False for SVD when only leading components needed"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#example-of-the-svd"
+    description: |
+      The default `full_matrices=True` computes the complete unitary matrices,
+      which is wasteful when only the first k singular vectors are used.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `<u_var>, <s_var>, <v_var> = (np|scipy).linalg.svd(<arr>)` where
+        only the first k columns/rows of u or v are subsequently accessed (e.g.
+        `u[:, :k]` or `v[:k, :]`).
+    action:
+      type: "ast_modification"
+      instructions: "Add `full_matrices=False` to the svd call."
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially when input is rectangular and tall/wide"
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "high"
+    tradeoffs:
+      - "Only applies when downstream code uses partial output. Detection must be conservative."
+
+  - id: "avoid_object_dtype_use_native"
+    name: "Avoid numpy object dtype; use a native scalar dtype"
+    source: "numpy_docs"
+    source_url: "https://numpy.org/doc/stable/user/basics.types.html"
+    description: |
+      Arrays with dtype=object store boxed Python objects and lose all the
+      C-level speedup of numpy. If the data is uniformly numeric/string, use
+      the appropriate native dtype.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find np.array / np.asarray / np.empty / pd.Series constructions whose
+        dtype is `object` or where dtype inference yields object (mixed-type
+        Python lists). Also detect via runtime `arr.dtype == np.dtype('O')`.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace dtype=object with the smallest correct native dtype: int64, float64, bool, np.datetime64 for dates, or pd.StringDtype / pyarrow string for strings.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially; allocations drop"
+    targets: ["latency_p50", "allocations", "peak_memory"]
+    confidence: "medium"
+    tradeoffs:
+      - "Forces a single type; will fail if the data is genuinely heterogeneous."
+    requires_human_consent: false
+
+  - id: "use_appropriate_numpy_dtype"
+    name: "Downcast numpy dtypes when range permits"
+    source: "numpy_docs"
+    source_url: "https://numpy.org/doc/stable/user/basics.types.html"
+    description: |
+      Default float64 / int64 may be wasteful. If values fit in float32 / int32 / int16 / uint8, downcast — halves or quarters memory and often speeds up bandwidth-bound ops.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: |
+        For large arrays (>1M elements) in hot paths, check `arr.dtype` and
+        observed value range (min, max). If range fits a smaller dtype with
+        margin, propose the downcast.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Construct or astype to the smaller dtype. For float work, validate that downstream computations retain enough precision (run numerical-tolerance tests).
+    verify:
+      method: "memory_delta"
+      criteria: "peak_memory improves; latency_p50 improves; numerical tests pass"
+    targets: ["peak_memory", "latency_p50", "allocations"]
+    confidence: "low"
+    tradeoffs:
+      - "float32 precision loss compounds over deep numerical pipelines."
+      - "Integer downcast can silently overflow if value range is misestimated."
+    requires_human_consent: true
+
+  - id: "use_numexpr_for_large_array_expressions"
+    name: "Use numexpr for large compound array arithmetic"
+    source: "scientific_python_lectures"
+    source_url: "https://lectures.scientific-python.org/advanced/optimizing/index.html#writing-faster-numerical-code"
+    description: |
+      numexpr compiles array expressions to a virtual machine that reuses
+      buffers, fuses ops, and uses multiple cores. Worthwhile for compound
+      expressions on arrays >1M elements.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find BinOp chains involving 3+ numpy arrays >= 1M elements where the
+        expression has no Python-level branching.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace `result = a*b + c*d - e` style expressions with
+        `result = numexpr.evaluate("a*b + c*d - e")`. Add the import.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; numerical equivalence verified"
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs:
+      - "Adds numexpr dependency."
+      - "Sub-million-element arrays may not benefit and can be slower due to call overhead."
+    requires_human_consent: true
+
+  - id: "vectorize_random_walks_with_cumsum"
+    name: "Replace accumulating loops with np.cumsum / itertools.accumulate"
+    source: "rougier_from_python_to_numpy"
+    source_url: "https://www.labri.fr/perso/nrougier/from-python-to-numpy/#code-vectorization"
+    description: |
+      Loops that accumulate a running value (random walks, partial sums,
+      prefix-max) can be expressed as np.cumsum / np.cumprod / np.maximum.accumulate or itertools.accumulate, eliminating the Python-level loop entirely.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find for loops whose body matches `acc = acc <op> <step>` followed by
+        `out.append(acc)`, where <step> is independent of acc.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Pre-compute the steps array, then `out = np.cumsum(steps)` for + accumulation, `np.cumprod` for *, `np.maximum.accumulate` for max-prefix, etc. For non-numpy data, use `list(itertools.accumulate(steps, op))`.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "Only applies when the step is independent of the accumulator (data-parallel)."
+
+  # ---------------------------------------------------------------------------
+  # Pandas (7) — from pandas official "Enhancing performance"
+  # ---------------------------------------------------------------------------
+
+  - id: "avoid_dataframe_apply_axis1"
+    name: "Avoid DataFrame.apply(..., axis=1) on hot paths"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html"
+    description: |
+      Row-wise apply creates a Series for each row and incurs heavy per-row Python overhead. Documented in the pandas Enhancing Performance guide as a primary anti-pattern to remove.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find calls to `<df>.apply(<func>, axis=1)`. Classify the function body:
+        if it consists of column-wise arithmetic, mark as vectorizable. If it
+        is more complex but pure-numerical, mark as numba-eligible.
+    action:
+      type: "ast_modification"
+      instructions: |
+        If function body is column arithmetic, rewrite as direct column operations: `df["c"] = df["a"] * (df["a"] - 1)` style. Otherwise see use_to_numpy_for_inner_loops or use_pandas_engine_numba.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially; behavior verified equivalent"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "use_to_numpy_for_inner_loops"
+    name: "Pass numpy arrays (via .to_numpy()) into inner-loop functions"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#using-ndarray"
+    description: |
+      The pandas guide documents that Series and DataFrame access in inner
+      loops creates per-call Series objects and routes through __getitem__,
+      both of which are expensive. Extract numpy arrays once with .to_numpy() and pass them into the inner loop.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find functions called inside loops that accept a DataFrame or Series
+        and access its elements by label or position.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Refactor the function to accept ndarrays. At the call site, replace
+        `f(df, ...)` with `f(df["col"].to_numpy(), ...)` for the relevant columns.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "Function loses access to the pandas index. If the index is semantic, pass it separately."
+
+  - id: "use_dataframe_eval_for_large_arithmetic"
+    name: "Use DataFrame.eval() for compound arithmetic on large frames"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#expression-evaluation-via-eval"
+    description: |
+      For DataFrames with >100k rows and compound arithmetic expressions across
+      multiple columns, .eval() routes through numexpr and avoids the intermediate Series objects that direct expressions allocate.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find compound DataFrame expressions across 3+ columns/operations and
+        for DataFrames with >100k rows (heuristic: profile shape, or threshold
+        via documented rule of thumb).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Convert `df["c"] = df["a"]*df["b"] + df["d"]/df["e"]` to
+        `df = df.eval("c = a*b + d/e")` (or use `inplace=True` style).
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves; verify numexpr is installed"
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs:
+      - "The pandas guide explicitly notes eval() is slower for small frames. Apply only when row count >= 10k as documented."
+      - "Loses static analysis: column references are strings, not Python names."
+
+  - id: "use_dataframe_query_for_filtering"
+    name: "Use DataFrame.query() for boolean filtering on large frames"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#expression-evaluation-via-eval"
+    description: |
+      Same numexpr-based engine as .eval(). For boolean filtering chains on
+      large DataFrames, .query() is more compact and often faster than
+      `df[(df.a > 0) & (df.b < 1)]`.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find Subscript nodes `df[<compound boolean expr involving df.col & df.col>]` on DataFrames with row count >= 10k.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Convert to `df.query("a > 0 and b < 1")`. For local variables, use the `@var` prefix per pandas docs.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves"
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs:
+      - "Same caveats as eval — slower for small frames."
+
+  - id: "use_pandas_categorical_for_low_cardinality_strings"
+    name: "Convert low-cardinality string columns to Categorical dtype"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/categorical.html"
+    description: |
+      Categorical dtype stores low-cardinality string columns as integer codes
+      with a dictionary, drastically reducing memory and speeding up groupby /
+      value_counts / merge.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: |
+        For each string/object column, compute n_unique / n_rows. If ratio < 0.5 and absolute n_unique < 1000, mark for conversion.
+    action:
+      type: "ast_modification"
+      instructions: |
+        At the point of dtype-fixing (read_csv with dtype=, or after load), set the column to `df[col] = df[col].astype("category")`.
+    verify:
+      method: "memory_delta"
+      criteria: "peak_memory improves; groupby/merge latency improves"
+    targets: ["peak_memory", "latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Categorical operations have different semantics in some edge cases (e.g. unknown categories). Verify tests still pass."
+
+  - id: "avoid_pandas_iterrows_use_itertuples"
+    name: "Replace df.iterrows() with df.itertuples() when iteration is unavoidable"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.itertuples.html"
+    description: |
+      iterrows() returns (index, Series) pairs, with all the per-row Series
+      construction overhead. itertuples() returns lightweight namedtuples and
+      is documented as the faster alternative. Better still: vectorize.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `for <i>, <row> in <df>.iterrows():` patterns.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace with `for <row> in <df>.itertuples(index=False):`. Adjust row access from `row[col_name]` to `row.col_name` (namedtuple attribute access).
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs:
+      - "Column names with spaces / dashes become _<n> positional. Such cases need explicit handling."
+    fallback_technique: "avoid_dataframe_apply_axis1"
+
+  - id: "use_pandas_engine_numba"
+    name: "Use engine='numba' on supported pandas methods"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#numba-jit-compilation"
+    description: |
+      Methods like rolling.apply, groupby.agg, and others accept engine="numba" to JIT-compile the operation. Pays off for >1M rows after warm-up.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find calls to rolling().apply / groupby().agg / similar where the
+        function passed is pure numerical and the DataFrame has >= 1M rows.
+    action:
+      type: "ast_modification"
+      instructions: "Add `engine='numba'` and `engine_kwargs={'nopython': True}`."
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves after warm-up; first-run compile cost noted separately"
+    targets: ["latency_p50", "compile_time"]
+    confidence: "medium"
+    tradeoffs:
+      - "Numba must be installed. First call is much slower due to JIT compilation."
+      - "Function body must be Numba-compatible (numerical, no arbitrary Python objects)."
+    requires_human_consent: true
+
+  # ---------------------------------------------------------------------------
+  # I/O (4) — from python.org docs
+  # ---------------------------------------------------------------------------
+
+  - id: "use_buffered_io_for_byte_streams"
+    name: "Use io.BufferedReader/BufferedWriter for byte-stream I/O"
+    source: "python_org_docs"
+    source_url: "https://docs.python.org/3/library/io.html#io.BufferedReader"
+    description: |
+      Wrapping raw file objects with buffering reduces the number of underlying
+      read/write syscalls. The python.org io module documents this as the
+      standard practice for performant byte I/O.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find usages of `open(path, "rb")` / `open(path, "wb")` where the
+        resulting file is read or written byte-by-byte or in small chunks (< 4096).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Either wrap with io.BufferedReader/BufferedWriter explicitly, or read/write in larger chunks (>= 64KB).
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on I/O-bound workloads"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Buffering changes write-visibility timing. Code expecting immediate flush must call .flush()."
+
+  - id: "read_csv_with_explicit_dtype"
+    name: "Specify dtypes when reading CSV with pandas"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/reference/api/pandas.read_csv.html"
+    description: |
+      Without an explicit dtype= argument, pandas infers types by sampling, which is slower and can produce object dtype for columns it can't infer cleanly. Passing dtype= avoids both.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find calls to `pd.read_csv(...)` without a `dtype=` argument where the
+        loaded DataFrame is used in performance-sensitive code.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Add `dtype={"col1": "int32", "col2": "float32", ...}`. For string columns intended as categorical, use `dtype={"col": "category"}`.
+    verify:
+      method: "benchmark_delta"
+      criteria: "load latency improves; peak_memory at load time improves"
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs:
+      - "Requires schema knowledge. If schema changes, the dtype dict must be updated."
+
+  - id: "stream_csv_with_iterator"
+    name: "Stream large CSVs in chunks rather than loading whole file"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/io.html#iterating-through-files-chunk-by-chunk"
+    description: |
+      For CSV files too large to fit comfortably in RAM, pandas documents the chunksize= iterator pattern. Each chunk is processed and discarded.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `pd.read_csv(<path>)` where the path resolves to a file > some
+        threshold (e.g. 500MB) at runtime, or where peak_memory profiling shows
+        load time dominates memory pressure.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Refactor to `for chunk in pd.read_csv(<path>, chunksize=100_000): <process(chunk)>`. The processing function must be expressible as a fold over chunks.
+    verify:
+      method: "memory_delta"
+      criteria: "peak_memory drops dramatically"
+    targets: ["peak_memory"]
+    confidence: "low"
+    tradeoffs:
+      - "Refactor is non-trivial: downstream code must accept chunk-by-chunk processing."
+      - "Operations requiring global view (sort, groupby across whole frame) need a two-pass design."
+    requires_human_consent: true
+
+  - id: "use_pyarrow_csv_for_large_loads"
+    name: "Use pyarrow CSV engine for large file loads"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/io.html#io-csv"
+    description: |
+      pandas supports engine="pyarrow" for read_csv, which is significantly
+      faster than the default C engine for large files. Documented in the
+      pandas IO guide.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find `pd.read_csv(...)` calls without `engine=` where the file is large
+        (>100MB heuristic) and the resulting DataFrame uses pyarrow-compatible
+        dtypes.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Add `engine="pyarrow"` and `dtype_backend="pyarrow"` if the downstream code is compatible with pyarrow-backed Series.
+    verify:
+      method: "benchmark_delta"
+      criteria: "load latency improves; behavior verified"
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs:
+      - "Adds pyarrow as a dependency."
+      - "pyarrow-backed strings behave slightly differently from numpy object strings in edge cases."
+    requires_human_consent: true
+
+  # ---------------------------------------------------------------------------
+  # Async / concurrency (4) — from python.org asyncio docs
+  # ---------------------------------------------------------------------------
+
+  - id: "use_asyncio_gather_for_concurrent_io"
+    name: "Use asyncio.gather() instead of sequential awaits for independent I/O"
+    source: "python_org_docs"
+    source_url: "https://docs.python.org/3/library/asyncio-task.html#asyncio.gather"
+    description: |
+      Sequentially awaiting independent coroutines serializes their I/O.
+      asyncio.gather(*coros) runs them concurrently.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find blocks of consecutive `await <coro>` statements where the awaited
+        coroutines have no data dependencies (no result of one passed to another).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Replace `r1 = await c1(); r2 = await c2(); r3 = await c3()` with
+        `r1, r2, r3 = await asyncio.gather(c1(), c2(), c3())`.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on the awaiting code path"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Concurrent execution may exceed downstream rate limits or connection pools — verify resource bounds."
+    requires_human_consent: true
+
+  - id: "use_create_task_for_fire_and_forget"
+    name: "Use asyncio.create_task() for fire-and-forget concurrency"
+    source: "python_org_docs"
+    source_url: "https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task"
+    description: |
+      When a coroutine should run alongside other work without immediately awaiting it, asyncio.create_task() schedules it on the loop.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Identify coroutines whose result is not needed immediately and whose
+        side effects are independent of subsequent code (e.g. logging, metrics push).
+    action:
+      type: "ast_modification"
+      instructions: |
+        Wrap with `task = asyncio.create_task(coro())`. Keep a reference to
+        prevent garbage collection; await on shutdown or via TaskGroup.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 of the calling path improves"
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs:
+      - "Lost task references are garbage-collected and may silently drop work. Must use TaskGroup or explicit retention."
+    requires_human_consent: true
+
+  - id: "use_concurrent_futures_threadpool_for_io_bound"
+    name: "Use concurrent.futures.ThreadPoolExecutor for blocking I/O parallelism"
+    source: "python_org_docs"
+    source_url: "https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor"
+    description: |
+      For non-async code with multiple independent blocking I/O calls, ThreadPoolExecutor.map runs them concurrently. Documented standard library approach.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find for-loops whose body is dominated by a single blocking I/O call
+        (file read, requests.get, socket recv) and where iterations are independent.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Refactor to `with ThreadPoolExecutor(max_workers=N) as ex: results = list(ex.map(<fn>, <iter>))`. Choose max_workers based on connection pool / file handle limits.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on I/O-bound workloads"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Order of result generation matches the input iterable (map), but completion order in flight may differ."
+      - "Not useful for CPU-bound work under the GIL — see use_multiprocessing_for_cpu_bound."
+    requires_human_consent: true
+
+  - id: "use_multiprocessing_for_cpu_bound"
+    name: "Use multiprocessing.Pool for CPU-bound parallelism"
+    source: "python_org_docs"
+    source_url: "https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool"
+    description: |
+      For CPU-bound work that cannot be vectorized via numpy, multiprocessing.Pool sidesteps the GIL by using separate processes.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find for-loops whose body is CPU-bound (no I/O, no numpy ufuncs),
+        and where iterations are independent and inputs/outputs are picklable.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Refactor to `with multiprocessing.Pool(processes=N) as pool: results = pool.map(<fn>, <iter>)`. Function must be top-level (importable) and inputs must be picklable.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves on multi-core machines; verify overhead is amortized over work"
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs:
+      - "Process startup is expensive (~100ms). Only beneficial when total work >> startup cost."
+      - "Pickling input/output may dominate for small tasks."
+      - "Free-threaded Python 3.13+ changes this calculus; revisit."
+    requires_human_consent: true
+
+  # ---------------------------------------------------------------------------
+  # Compile-to-native escape hatch (4) — from pandas Enhancing Performance + Cython docs
+  # ---------------------------------------------------------------------------
+
+  - id: "use_numba_jit_for_numerical_hot_loops"
+    name: "Use @numba.jit(nopython=True) on numerical hot loops"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#numba-jit-compilation"
+    description: |
+      For numerical loops that cannot be cleanly vectorized, decorating with
+      @numba.jit(nopython=True) JIT-compiles them to native code with substantial speedup, no C toolchain required.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find pure-numerical functions (only arithmetic on numpy scalars/arrays,
+        no Python objects, no I/O) that appear in hot paths from profiling.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Add `from numba import jit` import. Decorate the function with
+        `@jit(nopython=True, cache=True)`. Verify the function compiles in nopython mode (will raise otherwise).
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially after warm-up; first-call compile cost separately reported"
+    targets: ["latency_p50", "compile_time"]
+    confidence: "medium"
+    tradeoffs:
+      - "Adds numba dependency."
+      - "First call pays JIT cost. Use cache=True to amortize across runs."
+      - "Some Python and numpy features unsupported in nopython mode."
+    requires_human_consent: true
+
+  - id: "use_numba_vectorize_for_elementwise"
+    name: "Use @numba.vectorize for elementwise functions"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#numba-jit-compilation"
+    description: |
+      For elementwise operations that aren't directly expressible as numpy
+      ufuncs, @numba.vectorize generates a ufunc-equivalent that operates on
+      whole arrays at native speed.
+    detect:
+      method: "ast_pattern"
+      instructions: |
+        Find functions used in apply/map patterns over arrays that are
+        elementwise pure-numerical.
+    action:
+      type: "ast_modification"
+      instructions: "Add `@numba.vectorize` decorator. Call site changes from `f(x).apply(...)` or list comprehensions to direct array invocation."
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially"
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs:
+      - "Same as numba.jit re: dependency and warm-up cost."
+    requires_human_consent: true
+
+  - id: "use_cython_with_cdef_types"
+    name: "Use Cython with cdef type annotations for inner numerical loops"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#cython-writing-c-extensions-for-pandas"
+    description: |
+      For numerical inner loops where Numba is unsuitable, the pandas Enhancing Performance guide documents Cython with C type annotations (cdef double, cpdef) yielding ~10x speedup over plain Cython and ~100x over pure Python.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: |
+        After exhausting vectorization and Numba options, identify the single
+        hottest numerical function in profiling. Mark it for Cython rewrite.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Extract the function to a .pyx file. Annotate parameters and locals
+        with cdef types (cdef double, cdef int, cdef np.ndarray[double]). Set up the build via pyproject.toml + cython compile step.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves substantially; build artifact reproducible"
+    targets: ["latency_p50", "compile_time"]
+    confidence: "low"
+    tradeoffs:
+      - "Major architectural change: introduces a build step and a non-Python artifact."
+      - "Cross-platform wheels become a concern."
+    requires_human_consent: true
+
+  - id: "cython_disable_boundscheck_wraparound"
+    name: "Disable Cython boundscheck and wraparound on verified-safe loops"
+    source: "pandas_docs"
+    source_url: "https://pandas.pydata.org/docs/user_guide/enhancingperf.html#disabling-compiler-directives"
+    description: |
+      Once a Cython function is correct, decorating with @cython.boundscheck(False) and @cython.wraparound(False) removes per-access safety checks and yields additional speedup. The pandas guide explicitly notes this trade-off.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: |
+        Only applicable after use_cython_with_cdef_types has been applied and tests pass. Look for cpdef/cdef functions that index into typed ndarrays.
+    action:
+      type: "ast_modification"
+      instructions: |
+        Add `@cython.boundscheck(False)` and `@cython.wraparound(False)` decorators to the function. Add `cimport cython` if missing.
+    verify:
+      method: "benchmark_delta"
+      criteria: "latency_p50 improves further; all tests pass under the safer build first, then under the unsafe build"
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs:
+      - "Out-of-bounds access causes segfault rather than IndexError. Removes safety net."
+      - "Negative indexing semantics change (no wraparound)."
+    requires_human_consent: true
+
+  # ---------------------------------------------------------------------------
+  # Closing technique: report ungrounded suggestions for human review
+  # ---------------------------------------------------------------------------
+
+  - id: "report_unrecognized_hot_path"
+    name: "Report hot paths not matched by any technique"
+    source: "transmute_methodology"
+    source_url: "internal://transmute/methodology"
+    description: |
+      If profiling identifies a hot path that no technique above matches,
+      do not attempt an ungrounded optimization. Report the hot path with
+      its profile signature for human review.
+    detect:
+      method: "ad_hoc_profile"
+      instructions: |
+        After running the iteration loop, any function appearing in the top
+        decile of cProfile output that was not modified by any technique
+        constitutes an unmatched hot path.
+    action:
+      type: "report_only"
+      instructions: |
+        Emit a structured report: function name, file:line, cumulative time, surrounding code (3 lines context), and the closest matching technique with confidence rationale. No code change.
+    verify:
+      method: "n/a"
+      criteria: "informational; human reviewer decides next steps"
+    targets: []
+    confidence: "high"
+    tradeoffs: []
+
+# -----------------------------------------------------------------------------
+# Workflow — how the agent executes against this spec
+# -----------------------------------------------------------------------------
+workflow:
+  pre_flight:
+    - "Verify pytest passes on HEAD; abort if not"
+    - "Verify requirements: line_profiler, memory_profiler, pytest-benchmark, tracemalloc (stdlib)"
+    - "Save benchmark baseline: pytest --benchmark-only --benchmark-save=baseline"
+    - "Run cProfile on representative benchmark; record top-decile functions"
+    - "If applicable, run mypy and save baseline output for type_check_does_not_regress check"
+
+  iteration:
+    max_iterations: 50
+    per_iteration:
+      - "Select highest-priority (technique, instance) pair matching unprocessed hot path"
+      - "Apply detect → action atomically; staged as a single commit"
+      - "Run contracts.tests; revert on failure"
+      - "Run contracts.benchmarks; revert if any benchmark regresses past tolerance"
+      - "Run contracts.invariants; revert on failure"
+      - "Compute composite score delta; keep if >= improvement_threshold, else revert"
+      - "Log iteration outcome (kept/reverted, dimension deltas, technique, file:line)"
+    convergence:
+      criterion: "rolling_window"
+      window: 3
+      no_improvement_iterations: 3
+      meaning: "stop if 3 consecutive iterations produced no kept change"
+
+  termination:
+    - "Emit per-iteration log"
+    - "Emit summary: techniques applied, composite improvement, per-dimension deltas"
+    - "Emit report_unrecognized_hot_path output for any remaining hot paths"
+    - "Open PR with the kept commits"
+
+# -----------------------------------------------------------------------------
+# Safety — bounds the agent cannot exceed
+# -----------------------------------------------------------------------------
+safety:
+  wall_clock_max_hours: 8
+  token_budget_total: 10_000_000
+  per_iteration_limits:
+    max_files_modified: 5
+    max_lines_added_or_removed: 200
+  forbidden_changes:
+    - "No deletion of tests"
+    - "No relaxation of pre-existing type hints"
+    - "No introduction of `# type: ignore` to silence type errors"
+    - "No introduction of bare `except:` or `except Exception: pass`"
+    - "No modification of files in tests/ except to fix tests broken by a refactor (must be flagged)"
+    - "No changes to setup.py / pyproject.toml beyond adding documented dependencies"
+    - "No changes that lower the minimum supported Python version declared in pyproject.toml"
+  consent_required_for:
+    - "Any technique with requires_human_consent: true"
+    - "Adding a new third-party dependency"
+    - "Introducing a compiled extension (Cython / pybind11 / C ext)"
+
+# -----------------------------------------------------------------------------
+# Provenance — sources cited per-technique, listed here for transparency
+# -----------------------------------------------------------------------------
+provenance:
+  authoring_discipline: |
+    Techniques in this spec are referenced from authoritative open-licensed
+    sources. No source content is reproduced verbatim. Each technique cites
+    a single source URL; the agent reads that URL at runtime when context
+    is needed beyond the technique's description here.
+
+    Where a technique is well-documented across multiple sources, the most
+    authoritative (closest to language/library maintainer) is cited.
+
+    No technique is included whose detection or action cannot be grounded in
+    a cited URL. Hypothetical optimizations and unsourced "common wisdom"
+    are explicitly excluded; see report_unrecognized_hot_path for the
+    escape valve.
+
+  sources:
+    - id: "scientific_python_lectures"
+      name: "Scientific Python Lectures"
+      url: "https://lectures.scientific-python.org/"
+      license: "CC-BY 4.0 (text) + BSD (code)"
+      maintainers: "Scientific Python community (Varoquaux, Gouillart, Vahtras, et al.)"
+      scope: "Numerical Python, profiling tools, vectorization, memory layout"
+
+    - id: "pandas_docs"
+      name: "pandas official documentation"
+      url: "https://pandas.pydata.org/docs/"
+      license: "BSD-3-Clause"
+      maintainers: "pandas-dev"
+      scope: "DataFrame-specific performance: eval/query, Cython, Numba, chunked I/O, categorical"
+
+    - id: "numpy_docs"
+      name: "NumPy official documentation"
+      url: "https://numpy.org/doc/stable/"
+      license: "BSD-3-Clause"
+      maintainers: "NumPy core team"
+      scope: "Array layout, dtypes, broadcasting, ufuncs"
+
+    - id: "python_org_faq"
+      name: "Python Programming FAQ"
+      url: "https://docs.python.org/3/faq/programming.html"
+      license: "PSF License (BSD-style permissive)"
+      maintainers: "Python core developers"
+      scope: "General-purpose Python idioms, the canonical answers"
+
+    - id: "python_org_docs"
+      name: "Python standard library documentation"
+      url: "https://docs.python.org/3/library/"
+      license: "PSF License"
+      maintainers: "Python core developers"
+      scope: "Stdlib primitives: collections, itertools, functools, io, re, asyncio, concurrent.futures, multiprocessing"
+
+    - id: "python_org_pep498"
+      name: "PEP 498 — Literal String Interpolation"
+      url: "https://peps.python.org/pep-0498/"
+      license: "Open (PEP license)"
+      maintainers: "Eric V. Smith"
+      scope: "f-string semantics and performance rationale"
+
+    - id: "python_org_pep572"
+      name: "PEP 572 — Assignment Expressions"
+      url: "https://peps.python.org/pep-0572/"
+      license: "Open (PEP license)"
+      maintainers: "Chris Angelico, Tim Peters, Guido van Rossum"
+      scope: "Walrus operator semantics"
+
+    - id: "rougier_from_python_to_numpy"
+      name: "From Python to NumPy"
+      author: "Nicolas P. Rougier (INRIA)"
+      url: "https://www.labri.fr/perso/nrougier/from-python-to-numpy/"
+      license: "CC-BY-NC-SA 4.0 (text) + BSD-2-Clause (code)"
+      maintainers: "Nicolas P. Rougier"
+      scope: "Vectorization patterns, custom ufunc construction, views vs copies"
+      notes: "Referenced for technique provenance only; no content reproduced."
+
+    - id: "transmute_methodology"
+      name: "Transmute methodology (internal)"
+      url: "internal://transmute/methodology"
+      license: "n/a (in-repo)"
+      scope: "Meta-techniques for the workflow itself, e.g. reporting unmatched hot paths"
+
+  scope_excluded:
+    - reason: "Architectural rewrites without mechanical detection"
+      examples:
+        - "Replacing pandas with Polars wholesale"
+        - "Rewriting CPython hot paths in C via the CPython C API"
+        - "Migration to PyPy (interpreter swap, not user-code change)"
+    - reason: "Domain-specific patterns that require domain knowledge"
+      examples:
+        - "Database query optimization (depends on schema, indexes, query planner)"
+        - "Network protocol-level optimization (depends on transport)"
+    - reason: "Free-threaded (no-GIL) Python 3.13+ specifics"
+      explanation: "Free-threaded build is still experimental; revisit in v0.2 after the ecosystem matures."
+    - reason: "GPU-accelerated paths (CuPy, JAX, PyTorch CUDA)"
+      explanation: "Substrate-specific; orthogonal axis of optimization. Could be its own gpu.yaml in future."
+    - reason: "Web framework-specific patterns (Django ORM, FastAPI, etc.)"
+      explanation: "Framework-specific. Could be its own django.yaml / fastapi.yaml."
