@@ -1,0 +1,1681 @@
+# =============================================================================
+# rust.yaml — Transmute operationalized optimization specification for Rust
+# =============================================================================
+#
+# Source: The Rust Performance Book by Nicholas Nethercote
+#   https://nnethercote.github.io/perf-book/
+#
+# Authority basis: Every technique in this file traces to a specific section of
+# the book, identified by source_chapter + source_url. The YAML's credibility
+# rests on the source's authority, not on novel optimization claims.
+#
+# Companion documents:
+#   OPERATIONALIZATION_NOTES.md — which chapters mapped, which deferred, why
+#   SCHEMA_REFERENCE.md         — semantics of every field in this file
+#
+# Execution model: this file is read by a capable agent (Claude). The agent
+# orchestrates the workflow using existing tool capabilities (bash, profilers,
+# cargo, sub-agents). No custom orchestration runtime exists or is needed.
+# =============================================================================
+
+schema_version: "0.1.0"
+spec_kind: "transmute_optimization_workflow"
+language: "rust"
+
+# -----------------------------------------------------------------------------
+# §1 TARGET — what we are operating on
+# -----------------------------------------------------------------------------
+
+target:
+  language: "rust"
+  toolchain_version: ">=1.70"   # adjust per codebase; some techniques require newer
+  toolchain_channel: "stable"   # techniques requiring nightly are flagged
+  build_command: "cargo build --release --workspace"
+  test_command: "cargo test --workspace --release"
+  bench_command: "cargo bench --workspace"
+  cargo_manifest: "Cargo.toml"
+  workspace_root: "."
+
+# -----------------------------------------------------------------------------
+# §2 CONTRACTS — what optimization must preserve
+# -----------------------------------------------------------------------------
+
+contracts:
+
+  # Tests must pass after every rewrite. Failure ⇒ discard rewrite.
+  tests:
+    - name: "all_tests_pass"
+      command: "cargo test --workspace --release"
+      timeout: "15m"
+      on_failure: "discard_rewrite"
+      required: true
+
+  # Benchmarks may regress within tolerance; large regression ⇒ discard.
+  benchmarks:
+    - name: "criterion_default"
+      command: "cargo criterion --message-format=json"
+      parser: "criterion_json"
+      baseline_file: ".transmute/baselines/criterion.json"
+      regression_tolerance_pct: 5.0   # 5% slowdown blocks rewrite
+      timeout: "30m"
+      optional_if_missing: true       # codebase may not have criterion benches
+
+  # Codebase-specific invariants. Populate per project (Bible/ADRs/contracts).
+  # Examples below; agent reads these from the methodology substrate.
+  invariants:
+    - name: "panic_freedom_in_release"
+      verification_command: "cargo clippy --release -- -D clippy::panic"
+      on_failure: "discard_rewrite"
+      optional: true
+    - name: "no_unsafe_introduced"
+      verification_command: "! git diff --unified=0 | grep -E '^\\+.*\\bunsafe\\b'"
+      on_failure: "discard_rewrite"
+      optional: true
+    # User-supplied invariants (loaded from methodology substrate):
+    # - name: "audit_chain_non_fork"
+    #   verification_command: "cargo test --test chain_reconciliation --release"
+
+  # Behavior-preservation checks beyond the test suite.
+  behavior:
+    - name: "public_api_unchanged"
+      verification_command: "cargo public-api diff"
+      on_failure: "require_human_review"
+      optional: true
+    - name: "cargo_doc_builds"
+      verification_command: "cargo doc --no-deps --workspace"
+      on_failure: "discard_rewrite"
+
+# -----------------------------------------------------------------------------
+# §3 MEASUREMENT DIMENSIONS — what counts as improvement
+# -----------------------------------------------------------------------------
+#
+# Each technique declares which dimensions it targets. Composite scoring
+# weighs all dimensions per the weights below. Negative deltas on un-targeted
+# dimensions are tolerated up to the regression_tolerance per dimension.
+
+dimensions:
+  - id: "loc"
+    description: "Lines of Rust code (cloc/tokei)"
+    measure_command: "tokei --output json --languages Rust"
+    parser: "tokei_json"
+    metric_path: "Rust.code"
+    improvement: "decrease"
+    weight: 0.10
+
+  - id: "allocations"
+    description: "Heap allocation count from DHAT run on representative workload"
+    measure_command: "cargo run --release --features dhat-heap --bin transmute-alloc-probe"
+    parser: "dhat_json"
+    metric_path: "totals.tu"        # total allocation units; see DHAT docs
+    improvement: "decrease"
+    weight: 0.30
+    requires_workload: true
+
+  - id: "peak_memory"
+    description: "Peak resident memory from DHAT or rusage"
+    measure_command: "cargo run --release --features dhat-heap --bin transmute-alloc-probe"
+    parser: "dhat_json"
+    metric_path: "totals.tgmax"
+    improvement: "decrease"
+    weight: 0.15
+    requires_workload: true
+
+  - id: "latency_p50"
+    description: "Median runtime per criterion benchmark"
+    measure_command: "cargo criterion --message-format=json"
+    parser: "criterion_json_p50"
+    improvement: "decrease"
+    weight: 0.30
+    requires_benchmarks: true
+
+  - id: "binary_size"
+    description: "Stripped release binary byte size"
+    measure_command: "stat -c '%s' target/release/$(basename $(pwd))"
+    parser: "raw_integer"
+    improvement: "decrease"
+    weight: 0.05
+
+  - id: "compile_time"
+    description: "Wall-clock release build time from clean"
+    measure_command: "cargo clean && /usr/bin/time -f '%e' cargo build --release --workspace 2>&1 | tail -1"
+    parser: "raw_float"
+    improvement: "decrease"
+    weight: 0.10
+
+composite_scoring:
+  method: "weighted_sum_of_normalized_deltas"
+  improvement_threshold: 0.005    # 0.5% composite improvement to commit
+  regression_tolerance_per_dim: 0.05   # any single dim regressing >5% blocks
+
+# -----------------------------------------------------------------------------
+# §4 TECHNIQUES — operationalized patterns from the book
+# -----------------------------------------------------------------------------
+#
+# Each technique has:
+#   id              — stable snake_case identifier
+#   source_chapter  — book chapter name (verbatim)
+#   source_url      — fragment URL to specific section
+#   detect          — how to find instances
+#   action          — what change to make
+#   verify          — how to measure that it helped
+#   targets         — which measurement dimensions it should improve
+#   confidence      — high|medium|low (see SCHEMA_REFERENCE.md §confidence)
+#   tradeoffs       — known dimensions it may worsen
+#   requires        — toolchain/feature prerequisites
+#
+# Techniques are GROUPED by source chapter for readability. The agent does
+# not rely on group order — selection is by workflow.iteration.prioritize_by.
+
+techniques:
+
+  # ===========================================================================
+  # GROUP: Build Configuration
+  # https://nnethercote.github.io/perf-book/build-configuration.html
+  # ===========================================================================
+
+  - id: "bc_use_release_build"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#release-builds"
+    detect:
+      method: "command_substring_check"
+      target_command_field: "target.build_command"
+      must_contain: "--release"
+    action:
+      description: "Ensure all benchmarking and production build commands use --release"
+      change_type: "configuration_check"
+      apply_if_missing: "fail_loudly"
+    verify: { method: "tautological_after_apply" }
+    targets: ["latency_p50", "binary_size"]
+    confidence: "high"
+    tradeoffs: ["compile_time"]
+    once_only: true
+
+  - id: "bc_set_codegen_units_one"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#codegen-units"
+    detect:
+      method: "cargo_toml_scan"
+      profile: "release"
+      key: "codegen-units"
+      condition: "missing_or_not_equal_to_1"
+    action:
+      description: "Set codegen-units = 1 in [profile.release] of Cargo.toml"
+      change_type: "cargo_toml_edit"
+      patch: |
+        [profile.release]
+        codegen-units = 1
+    verify:
+      method: "rebench_after_change"
+      dimensions: ["latency_p50", "binary_size"]
+    targets: ["latency_p50", "binary_size"]
+    confidence: "high"
+    tradeoffs: ["compile_time"]
+    once_only: true
+
+  - id: "bc_enable_fat_lto"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#link-time-optimization"
+    detect:
+      method: "cargo_toml_scan"
+      profile: "release"
+      key: "lto"
+      condition: "missing_or_value_in:[false, off, thin]"
+    action:
+      description: "Set lto = \"fat\" in [profile.release]"
+      change_type: "cargo_toml_edit"
+      patch: |
+        [profile.release]
+        lto = "fat"
+    verify: { method: "rebench_after_change", dimensions: ["latency_p50", "binary_size"] }
+    targets: ["latency_p50", "binary_size"]
+    confidence: "high"
+    tradeoffs: ["compile_time"]
+    fallback_technique: "bc_enable_thin_lto"   # if fat LTO regresses, try thin
+    once_only: true
+
+  - id: "bc_enable_thin_lto"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#link-time-optimization"
+    detect:
+      method: "cargo_toml_scan"
+      profile: "release"
+      key: "lto"
+      condition: "missing_or_value_in:[false, off]"
+    action:
+      description: "Set lto = \"thin\" in [profile.release]"
+      change_type: "cargo_toml_edit"
+      patch: |
+        [profile.release]
+        lto = "thin"
+    verify: { method: "rebench_after_change", dimensions: ["latency_p50", "binary_size"] }
+    targets: ["latency_p50", "binary_size"]
+    confidence: "high"
+    tradeoffs: ["compile_time"]
+    once_only: true
+
+  - id: "bc_alternative_allocator_mimalloc"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#mimalloc"
+    detect:
+      method: "compound"
+      checks:
+        - method: "rust_source_scan"
+          pattern: "#\\[global_allocator\\]"
+          condition: "absent_in_workspace_binaries"
+        - method: "cargo_toml_scan"
+          dep_name: "mimalloc"
+          condition: "absent"
+    action:
+      description: "Add mimalloc dep and #[global_allocator] static to each binary crate's main.rs"
+      change_type: "compound"
+      steps:
+        - "cargo add mimalloc"
+        - "insert at top of each src/main.rs:\n    #[global_allocator]\n    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;"
+    verify: { method: "rebench_after_change", dimensions: ["latency_p50", "allocations", "peak_memory"] }
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs: ["binary_size", "compile_time"]
+    fallback_technique: "bc_alternative_allocator_jemalloc"
+    once_only: true
+    notes: |
+      Per the book: large speedups and memory reductions seen in practice, but
+      effect varies by platform and program. Always benchmark.
+
+  - id: "bc_alternative_allocator_jemalloc"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#jemalloc"
+    detect:
+      method: "compound"
+      checks:
+        - method: "rust_source_scan"
+          pattern: "#\\[global_allocator\\]"
+          condition: "absent_in_workspace_binaries"
+        - method: "platform_check"
+          allowed_platforms: ["linux", "macos"]
+    action:
+      description: "Add tikv-jemallocator dep and #[global_allocator] (Linux/macOS only)"
+      change_type: "compound"
+      steps:
+        - "cargo add tikv-jemallocator"
+        - "insert at top of each src/main.rs:\n    #[global_allocator]\n    static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;"
+    verify: { method: "rebench_after_change", dimensions: ["latency_p50", "allocations", "peak_memory"] }
+    targets: ["latency_p50", "peak_memory"]
+    confidence: "medium"
+    tradeoffs: ["binary_size", "compile_time"]
+    once_only: true
+
+  - id: "bc_target_cpu_native"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#cpu-specific-instructions"
+    detect:
+      method: "config_toml_scan"
+      file: ".cargo/config.toml"
+      key: "build.rustflags"
+      condition: "does_not_contain:target-cpu=native"
+    action:
+      description: "Add rustflags = [\"-C\", \"target-cpu=native\"] to .cargo/config.toml [build] table"
+      change_type: "cargo_config_edit"
+      surface_to_human: "binary will only run on machines with same/newer CPU features"
+    verify: { method: "rebench_after_change", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: ["portability"]   # NOT a measured dimension; SURFACED for human
+    requires_human_consent: true
+    once_only: true
+
+  - id: "bc_panic_abort"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#abort-on-panic"
+    detect:
+      method: "compound"
+      checks:
+        - method: "cargo_toml_scan"
+          profile: "release"
+          key: "panic"
+          condition: "not_equal_to:abort"
+        - method: "rust_source_scan"
+          pattern: "catch_unwind"
+          condition: "absent"
+    action:
+      description: "Set panic = \"abort\" in [profile.release] iff catch_unwind not used"
+      change_type: "cargo_toml_edit"
+      patch: |
+        [profile.release]
+        panic = "abort"
+    verify: { method: "rebench_after_change", dimensions: ["latency_p50", "binary_size"] }
+    targets: ["latency_p50", "binary_size"]
+    confidence: "medium"
+    tradeoffs: ["semantics"]   # behavior change on panic
+    requires_human_consent: true
+    once_only: true
+
+  - id: "bc_strip_symbols"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#strip-symbols"
+    detect:
+      method: "cargo_toml_scan"
+      profile: "release"
+      key: "strip"
+      condition: "missing"
+    action:
+      description: "Set strip = \"symbols\" in [profile.release]"
+      change_type: "cargo_toml_edit"
+      patch: |
+        [profile.release]
+        strip = "symbols"
+    verify: { method: "remeasure_after_change", dimensions: ["binary_size"] }
+    targets: ["binary_size"]
+    confidence: "high"
+    tradeoffs: ["debuggability"]
+    once_only: true
+
+  - id: "bc_faster_linker_lld"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#linking"
+    detect:
+      method: "compound"
+      checks:
+        - method: "config_toml_scan"
+          file: ".cargo/config.toml"
+          key: "build.rustflags"
+          condition: "does_not_contain:fuse-ld"
+        - method: "platform_check"
+          allowed_platforms: ["linux", "windows"]
+    action:
+      description: "Add -C link-arg=-fuse-ld=lld to .cargo/config.toml [build] rustflags"
+      change_type: "cargo_config_edit"
+    verify: { method: "remeasure_after_change", dimensions: ["compile_time"] }
+    targets: ["compile_time"]
+    confidence: "high"
+    tradeoffs: []
+    once_only: true
+    notes: |
+      Per the book: as of Rust 1.90 lld is default on Linux. Technique remains
+      relevant on Windows and older toolchains.
+
+  - id: "bc_disable_dev_debuginfo"
+    source_chapter: "Build Configuration"
+    source_url: "https://nnethercote.github.io/perf-book/build-configuration.html#disable-debug-info-generation"
+    detect:
+      method: "cargo_toml_scan"
+      profile: "dev"
+      key: "debug"
+      condition: "missing_or_truthy"
+    action:
+      description: "Set [profile.dev] debug = false (or \"line-tables-only\")"
+      change_type: "cargo_toml_edit"
+      patch: |
+        [profile.dev]
+        debug = false
+    verify: { method: "remeasure_after_change", dimensions: ["compile_time"] }
+    targets: ["compile_time"]
+    confidence: "high"
+    tradeoffs: ["debuggability"]   # affects only dev workflow
+    once_only: true
+
+  # ===========================================================================
+  # GROUP: Linting
+  # https://nnethercote.github.io/perf-book/linting.html
+  # ===========================================================================
+
+  - id: "lint_apply_clippy_perf_group"
+    source_chapter: "Linting"
+    source_url: "https://nnethercote.github.io/perf-book/linting.html"
+    detect:
+      method: "clippy_run"
+      command: "cargo clippy --workspace --release --all-targets -- -W clippy::perf"
+      parser: "clippy_json"
+      filter_lint_groups: ["clippy::perf"]
+    action:
+      description: "Apply each clippy::perf lint suggestion as a separate sub-iteration"
+      change_type: "lint_directed_rewrite"
+      iterate_per_diagnostic: true
+    verify: { method: "tests_pass_plus_no_regression", dimensions: ["loc", "latency_p50"] }
+    targets: ["latency_p50", "loc"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "lint_disallow_std_hashmap_if_fxhash_adopted"
+    source_chapter: "Linting"
+    source_url: "https://nnethercote.github.io/perf-book/linting.html#disallowing-types"
+    detect:
+      method: "compound"
+      checks:
+        - method: "rust_source_scan"
+          pattern: "use rustc_hash::|use fxhash::"
+          condition: "present_anywhere"
+        - method: "file_check"
+          file: "clippy.toml"
+          key: "disallowed-types"
+          condition: "does_not_contain:std::collections::HashMap"
+    action:
+      description: "Add std::collections::HashMap and HashSet to disallowed-types in clippy.toml"
+      change_type: "clippy_toml_edit"
+      patch: |
+        disallowed-types = ["std::collections::HashMap", "std::collections::HashSet"]
+    verify: { method: "tautological_after_apply" }
+    targets: []   # preventive — guards against regression to default hasher
+    confidence: "high"
+    tradeoffs: []
+    once_only: true
+
+  # ===========================================================================
+  # GROUP: Inlining
+  # https://nnethercote.github.io/perf-book/inlining.html
+  # ===========================================================================
+
+  - id: "inline_small_hot_function"
+    source_chapter: "Inlining"
+    source_url: "https://nnethercote.github.io/perf-book/inlining.html#simple-cases"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        fn whose body is <= 5 statements
+        AND has no #[inline*] attribute already
+        AND is in hot_path set (workflow.pre_flight.identify_hot_paths)
+        AND is cross-crate-callable (pub) OR has only one call site in same crate
+      tool_hint: "rust-analyzer + cachegrind for inlining check"
+    action:
+      description: "Add #[inline] attribute to the function"
+      change_type: "ast_modification"
+      diff_template: |
+        -fn {name}({args}) -> {ret} {
+        +#[inline]
+        +fn {name}({args}) -> {ret} {
+    verify:
+      method: "criterion_benchmark_for_hot_path"
+      dimensions: ["latency_p50"]
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: ["compile_time", "binary_size"]
+    notes: "Per book: effects unpredictable; measure. Sometimes slows down code."
+
+  - id: "inline_cold_attribute"
+    source_chapter: "Inlining"
+    source_url: "https://nnethercote.github.io/perf-book/inlining.html#outlining"
+    detect:
+      method: "ast_pattern"
+      pattern: "fn in identified_cold_paths AND has no #[cold] attribute"
+    action:
+      description: "Add #[cold] attribute to rarely-called function to improve hot-path codegen"
+      change_type: "ast_modification"
+    verify: { method: "criterion_benchmark_for_hot_path", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+
+  # ===========================================================================
+  # GROUP: Hashing
+  # https://nnethercote.github.io/perf-book/hashing.html
+  # ===========================================================================
+
+  - id: "hash_fxhash_for_integer_keys"
+    source_chapter: "Hashing"
+    source_url: "https://nnethercote.github.io/perf-book/hashing.html#alternative-hashers"
+    detect:
+      method: "type_signature_search"
+      patterns:
+        - "HashMap<u8, _>"
+        - "HashMap<u16, _>"
+        - "HashMap<u32, _>"
+        - "HashMap<u64, _>"
+        - "HashMap<usize, _>"
+        - "HashMap<i32, _>"
+        - "HashMap<i64, _>"
+        - "HashSet<u8>"
+        - "HashSet<u16>"
+        - "HashSet<u32>"
+        - "HashSet<u64>"
+        - "HashSet<usize>"
+      exclude_filter: "already uses non-default hasher (FxHashMap, FnvHashMap, AHashMap, HashMap<_,_,S>)"
+      hashdos_filter: "exclude maps reachable from untrusted input"   # SURFACE if uncertain
+    action:
+      description: "Replace HashMap/HashSet with rustc_hash::FxHashMap/FxHashSet; add rustc-hash dep"
+      change_type: "compound"
+      steps:
+        - "cargo add rustc-hash"
+        - "AST: replace HashMap<K,V> with FxHashMap<K,V> at each site"
+        - "AST: replace HashSet<T> with FxHashSet<T> at each site"
+        - "Add use rustc_hash::{FxHashMap, FxHashSet};"
+    verify: { method: "criterion_benchmark_for_hot_path", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: ["hashdos_resistance"]   # SURFACED for human judgment
+    requires_human_consent: true
+    notes: |
+      HashDoS-resistance trade: FxHash is not collision-resistant. Confirm with
+      operator that keys are not derived from adversarial input before applying.
+
+  - id: "hash_nohash_for_random_integer_newtype"
+    source_chapter: "Hashing"
+    source_url: "https://nnethercote.github.io/perf-book/hashing.html#alternative-hashers"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        Newtype struct wrapping an integer whose values are random or near-random
+        AND used as HashMap key in hot path
+    action:
+      description: "Use nohash_hasher::IntMap / IntSet for the newtype's HashMap"
+      change_type: "compound"
+      steps:
+        - "cargo add nohash-hasher"
+        - "Replace HashMap<NewtypeT, V> with IntMap<NewtypeT, V>"
+        - "Implement nohash_hasher::IsEnabled for NewtypeT"
+    verify: { method: "criterion_benchmark_for_hot_path", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs: []
+    requires_human_consent: true
+    notes: "Distribution-dependent. Surface to operator before applying."
+
+  # ===========================================================================
+  # GROUP: Heap Allocations  (largest group — most operationalizable surface)
+  # https://nnethercote.github.io/perf-book/heap-allocations.html
+  # ===========================================================================
+
+  - id: "heap_vec_with_capacity_for_known_loop_bound"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#vec"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        let mut V: Vec<_> = Vec::new() | vec![] | Vec::default()
+        FOLLOWED BY
+        for/while loop body that calls V.push(...) | V.extend(...)
+        WHERE loop iteration count is statically determinable
+        (e.g. for ... in 0..N, for ... in &collection_with_known_len)
+    action:
+      description: "Replace Vec::new() with Vec::with_capacity(N) where N is the loop's iteration count"
+      change_type: "ast_modification"
+      diff_template: |
+        -let mut v = Vec::new();
+        +let mut v = Vec::with_capacity(N);
+    verify:
+      method: "dhat_allocation_count"
+      dimensions: ["allocations"]
+      expected_change: "decrease"
+    targets: ["allocations", "latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+    notes: "If loop body has conditional pushes, with_capacity is an upper bound; that is still fine."
+
+  - id: "heap_string_with_capacity_for_known_size"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#string"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        let mut s = String::new() | String::default()
+        FOLLOWED BY
+        loop pushing chars/strs to s
+        WHERE final length is determinable from input
+    action:
+      description: "Replace String::new() with String::with_capacity(N)"
+      change_type: "ast_modification"
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "heap_hashmap_with_capacity_for_known_size"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#hash-tables"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        HashMap::new() | HashSet::new() | FxHashMap::default() etc.
+        FOLLOWED BY
+        loop with statically-known iteration count inserting elements
+    action:
+      description: "Replace ::new()/::default() with ::with_capacity(N) (or ::with_capacity_and_hasher for custom hasher)"
+      change_type: "ast_modification"
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "heap_smallvec_for_consistently_short_vecs"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#short-vecs"
+    detect:
+      method: "ad_hoc_profile"
+      pattern: |
+        Hot Vec allocation site (from DHAT)
+        AND length distribution shows P99 <= K for some small K (e.g. K <= 8)
+      requires_workload: true
+    action:
+      description: "Replace Vec<T> with SmallVec<[T; K]> at the type definition; add smallvec dep; update vec![] to smallvec![] at literal sites"
+      change_type: "compound"
+      steps:
+        - "cargo add smallvec"
+        - "type substitution at struct/field/local"
+        - "replace `vec![..]` with `smallvec![..]` literal at construction sites"
+    verify: { method: "dhat_allocation_count + criterion", dimensions: ["allocations", "latency_p50"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: ["peak_memory", "binary_size"]   # SmallVec can be larger than Vec
+    notes: "Per book: SmallVec is slightly slower for normal ops due to discriminant check. Measure."
+
+  - id: "heap_arrayvec_when_max_length_known"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#short-vecs"
+    detect:
+      method: "ad_hoc_profile"
+      pattern: |
+        Hot Vec allocation site
+        AND length is BOUNDED with KNOWN maximum (proof from caller or input shape)
+    action:
+      description: "Replace Vec<T> with ArrayVec<T, N>; add arrayvec dep"
+      change_type: "compound"
+      steps:
+        - "cargo add arrayvec"
+        - "type substitution"
+    verify: { method: "dhat_allocation_count + criterion", dimensions: ["allocations", "latency_p50"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+    requires_human_consent: true   # max bound is a correctness claim
+
+  - id: "heap_smartstring_for_short_strings"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#string"
+    detect:
+      method: "ad_hoc_profile"
+      pattern: |
+        Hot String allocation site
+        AND length distribution shows P99 <= 23 bytes (smartstring inline threshold on 64-bit)
+    action:
+      description: "Replace String with smartstring::SmartString<LazyCompact>"
+      change_type: "compound"
+      steps:
+        - "cargo add smartstring"
+        - "type substitution"
+    verify: { method: "dhat_allocation_count + criterion", dimensions: ["allocations", "latency_p50"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+
+  - id: "heap_redundant_clone_on_hot_path"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#clone"
+    detect:
+      method: "compound"
+      checks:
+        - method: "grep_with_context"
+          pattern: "\\.clone\\(\\)"
+          context_filter: "hot_path"
+        - method: "ast_pattern"
+          pattern: |
+            EXCLUDE: clone on Rc/Arc (these are cheap)
+            EXCLUDE: clone whose return value is moved into an owned-typed slot
+            INCLUDE: clone followed by usage where &T would suffice
+    action:
+      description: "Remove .clone() and adjust callee to take &T; or restructure ownership so original is borrowed"
+      change_type: "ast_modification"
+      strategies:
+        - "if callee signature is fn(_: T), see if changing to fn(_: &T) is feasible without rippling far"
+        - "if clone feeds an expression that does not need ownership, take a reference"
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+    notes: |
+      Per book: 'some clone calls due to programmer error or stale code can simply
+      be removed.' Per bible: this is the canonical operationalizable technique.
+      Confidence is medium not high because the refactor can ripple.
+
+  - id: "heap_clone_from_over_assign_clone"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#clone"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        Statement of form: A = B.clone()
+        WHERE typeof(A) is one of {Vec, String, HashMap, HashSet, BTreeMap, BTreeSet, PathBuf, OsString}
+        AND A is a pre-existing binding (not the same statement that introduced it)
+    action:
+      description: "Replace A = B.clone() with A.clone_from(&B) to reuse A's allocation"
+      change_type: "ast_modification"
+      diff_template: |
+        -a = b.clone();
+        +a.clone_from(&b);
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "heap_cow_for_mixed_static_dynamic_strings"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#cow"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        Vec<String> | HashMap<_, String> | similar
+        WHERE construction sites include BOTH:
+          - string literals promoted via .to_string()/.to_owned()/String::from(<literal>)
+          - dynamically constructed strings (format!, etc.)
+    action:
+      description: "Change container element type to Cow<'static, str> and replace .to_string() on literals with Cow::Borrowed"
+      change_type: "ast_modification"
+      diff_template: |
+        -let mut errors: Vec<String> = vec![];
+        -errors.push("oops".to_string());
+        -errors.push(format!("line {}", n));
+        +let mut errors: Vec<Cow<'static, str>> = vec![];
+        +errors.push(Cow::Borrowed("oops"));
+        +errors.push(Cow::Owned(format!("line {}", n)));
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations"]
+    confidence: "medium"
+    tradeoffs: []
+    notes: "Per book: 'Cow can be fiddly to get working, but it is often worth the effort.'"
+
+  - id: "heap_workhorse_collection_outside_loop"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#reusing-collections"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        for/while/loop {
+            let mut C = Vec::new() | String::new() | HashMap::new()
+            ... uses of C ...
+            // C goes out of scope at end of iteration
+        }
+        AND each iteration's contents are independent (no carry-over)
+        AND no other live borrow conflicts with reuse
+    action:
+      description: "Hoist collection declaration above the loop; call C.clear() at start of each iteration"
+      change_type: "ast_modification"
+      diff_template: |
+        +let mut c = Vec::new();
+         for ... {
+        -    let mut c = Vec::new();
+        +    c.clear();
+             /* use c */
+         }
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations"]
+    confidence: "medium"
+    tradeoffs: ["readability"]   # obscures per-iteration locality
+    notes: "Per book: 'obscures the fact that each iteration's usage is unrelated.'"
+
+  - id: "heap_bufread_read_line_over_lines"
+    source_chapter: "Heap Allocations"
+    source_url: "https://nnethercote.github.io/perf-book/heap-allocations.html#reading-lines-from-a-file"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        for line in <impl BufRead>.lines() { ... }
+        WHERE loop body operates on line via &str-compatible operations only
+    action:
+      description: "Replace .lines() loop with workhorse-String read_line loop"
+      change_type: "ast_modification"
+      diff_template: |
+        -for line in reader.lines() {
+        -    let line = line?;
+        -    process(&line);
+        -}
+        +let mut line = String::new();
+        +while reader.read_line(&mut line)? != 0 {
+        +    process(&line);
+        +    line.clear();
+        +}
+    verify: { method: "dhat_allocation_count", dimensions: ["allocations"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  # ===========================================================================
+  # GROUP: Type Sizes
+  # https://nnethercote.github.io/perf-book/type-sizes.html
+  # ===========================================================================
+
+  - id: "type_box_large_enum_variant"
+    source_chapter: "Type Sizes"
+    source_url: "https://nnethercote.github.io/perf-book/type-sizes.html#smaller-enums"
+    detect:
+      method: "compound"
+      checks:
+        - method: "rustc_print_type_sizes"
+          command: "RUSTFLAGS=-Zprint-type-sizes cargo +nightly build --release 2>&1"
+          parser: "print_type_sizes"
+          filter: "enum_variant_size_ratio_max_to_avg >= 3"
+        - method: "clippy_lint"
+          lint: "clippy::large_enum_variant"
+      confidence_uplift_if_both_agree: true
+    action:
+      description: "Box the largest variant's payload: enum E { ..., Big(LargeT) } → enum E { ..., Big(Box<LargeT>) }"
+      change_type: "ast_modification"
+      diff_template: |
+        -enum E { ..., Big(LargeT), ... }
+        +enum E { ..., Big(Box<LargeT>), ... }
+        # caller sites: update pattern matches and constructions
+    verify:
+      method: "compound"
+      checks:
+        - method: "rustc_print_type_sizes"
+          condition: "enum size decreased"
+        - method: "criterion + dhat"
+          dimensions: ["allocations", "latency_p50"]
+    targets: ["peak_memory", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: ["allocations"]   # adds heap alloc on the Big variant
+    notes: |
+      Net win only if Big variant is relatively rare. Per book: 'requires an extra
+      heap allocation for the Z variant.' Surface variant frequency to operator.
+
+  - id: "type_boxed_slice_for_immutable_vec"
+    source_chapter: "Type Sizes"
+    source_url: "https://nnethercote.github.io/perf-book/type-sizes.html#boxed-slices"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        Struct field of type Vec<T> | local Vec<T>
+        WHERE after construction, NO calls to .push/.pop/.insert/.remove/.clear/.extend/.reserve appear
+        AND len() is read-only thereafter
+    action:
+      description: "Change Vec<T> to Box<[T]>; convert at construction with .into_boxed_slice()"
+      change_type: "ast_modification"
+      diff_template: |
+        -pub field: Vec<T>,
+        +pub field: Box<[T]>,
+         // construction: ... .into_boxed_slice()
+    verify: { method: "remeasure_after_change", dimensions: ["peak_memory"] }
+    targets: ["peak_memory"]
+    confidence: "medium"
+    tradeoffs: []
+
+  - id: "type_thinvec_for_oft_empty_vec"
+    source_chapter: "Type Sizes"
+    source_url: "https://nnethercote.github.io/perf-book/type-sizes.html#thinvec"
+    detect:
+      method: "ad_hoc_profile"
+      pattern: |
+        Struct field Vec<T> where field is empty >70% of the time
+        AND the struct is heavily instantiated
+    action:
+      description: "Replace Vec<T> with ThinVec<T> from thin_vec crate"
+      change_type: "compound"
+      steps:
+        - "cargo add thin-vec"
+        - "type substitution at field declaration and usage sites"
+    verify: { method: "remeasure_after_change", dimensions: ["peak_memory"] }
+    targets: ["peak_memory"]
+    confidence: "low"
+    tradeoffs: []
+    requires_workload: true
+
+  - id: "type_smaller_integer_for_bounded_indices"
+    source_chapter: "Type Sizes"
+    source_url: "https://nnethercote.github.io/perf-book/type-sizes.html#smaller-integers"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        Struct field of type usize used as an index
+        WHERE static analysis or operator-supplied bound shows index always fits in u32 (or u16/u8)
+    action:
+      description: "Change usize to u32 (or smaller); coerce at use points via `as usize`"
+      change_type: "ast_modification"
+    verify: { method: "remeasure_after_change", dimensions: ["peak_memory", "latency_p50"] }
+    targets: ["peak_memory"]
+    confidence: "low"
+    tradeoffs: ["correctness_risk"]
+    requires_human_consent: true
+    notes: "Width reduction is a correctness commitment. Always surface."
+
+  - id: "type_static_assertion_for_hot_type"
+    source_chapter: "Type Sizes"
+    source_url: "https://nnethercote.github.io/perf-book/type-sizes.html#avoiding-regressions"
+    detect:
+      method: "compound"
+      checks:
+        - method: "ad_hoc_profile"
+          condition: "type identified as hot via DHAT or size-sensitivity analysis"
+        - method: "rust_source_scan"
+          pattern: "static_assertions::assert_eq_size!\\s*\\(\\s*{type_name}"
+          condition: "absent"
+    action:
+      description: "Add a static_assertions::assert_eq_size!(T, [u8; N]) guard for hot type T"
+      change_type: "ast_modification"
+      diff_template: |
+        +#[cfg(target_arch = "x86_64")]
+        +static_assertions::assert_eq_size!(HotType, [u8; N]);
+    verify: { method: "tautological_after_apply" }
+    targets: []   # preventive
+    confidence: "high"
+    tradeoffs: []
+    notes: "Locks in current size to prevent silent regression in future PRs."
+
+  # ===========================================================================
+  # GROUP: Standard Library Types
+  # https://nnethercote.github.io/perf-book/standard-library-types.html
+  # ===========================================================================
+
+  - id: "stdlib_vec_zero_init_macro"
+    source_chapter: "Standard Library Types"
+    source_url: "https://nnethercote.github.io/perf-book/standard-library-types.html#vec-1"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        let mut v = Vec::with_capacity(n) | Vec::new()
+        for _ in 0..n { v.push(0) | v.push(T::default()) }
+        # or: v.resize(n, 0); / v.extend(iter::repeat(0).take(n));
+    action:
+      description: "Replace with `vec![0; n]` (uses OS-assisted zero-fill where possible)"
+      change_type: "ast_modification"
+      diff_template: |
+        -let mut v = Vec::with_capacity(n);
+        -for _ in 0..n { v.push(0); }
+        +let v = vec![0; n];
+    verify: { method: "criterion + dhat", dimensions: ["latency_p50", "allocations"] }
+    targets: ["latency_p50", "allocations"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "stdlib_swap_remove_when_order_irrelevant"
+    source_chapter: "Standard Library Types"
+    source_url: "https://nnethercote.github.io/perf-book/standard-library-types.html#vec-1"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        v.remove(i)
+        WHERE v's element order is not depended on afterwards
+        (no .sort, no iteration that asserts ordering, no index-stability requirement)
+    action:
+      description: "Replace v.remove(i) with v.swap_remove(i)"
+      change_type: "ast_modification"
+    verify: { method: "tests_pass + criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: ["semantics"]   # ordering change is observable
+    requires_human_consent: true
+    notes: "Surface to operator: 'this changes element order — confirm no caller depends on it.'"
+
+  - id: "stdlib_vec_retain_over_filter_rebuild"
+    source_chapter: "Standard Library Types"
+    source_url: "https://nnethercote.github.io/perf-book/standard-library-types.html#vec-1"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        v = v.into_iter().filter(|x| pred(x)).collect::<Vec<_>>()
+        OR
+        let new_v: Vec<_> = v.iter().filter(...).cloned().collect();
+        followed by v = new_v
+    action:
+      description: "Replace filter+collect with v.retain(|x| pred(x))"
+      change_type: "ast_modification"
+      diff_template: |
+        -v = v.into_iter().filter(|x| pred(x)).collect();
+        +v.retain(|x| pred(x));
+    verify: { method: "dhat + criterion", dimensions: ["allocations", "latency_p50"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+
+  - id: "stdlib_lazy_fallback_for_option_result"
+    source_chapter: "Standard Library Types"
+    source_url: "https://nnethercote.github.io/perf-book/standard-library-types.html#option-and-result"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        x.ok_or(EXPR)        WHERE EXPR is a call, format!, allocation, or method invocation
+        | x.unwrap_or(EXPR)
+        | x.map_or(EXPR, ...)
+        | x.or(EXPR)
+      exclude: "EXPR is a literal, const expr, or trivial enum constructor"
+    action:
+      description: "Replace eager .X(EXPR) with lazy .X_else(|| EXPR)"
+      change_type: "ast_modification"
+      diff_template: |
+        -opt.ok_or(expensive_compute())
+        +opt.ok_or_else(|| expensive_compute())
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+    notes: "Clippy lints some of these (clippy::or_fun_call); apply broadly."
+
+  - id: "stdlib_parking_lot_mutex"
+    source_chapter: "Standard Library Types"
+    source_url: "https://nnethercote.github.io/perf-book/standard-library-types.html#mutex-rwlock-condvar-and-once"
+    detect:
+      method: "compound"
+      checks:
+        - method: "ast_pattern"
+          pattern: "std::sync::(Mutex|RwLock|Condvar|Once)"
+        - method: "criterion_benchmark_present_for_contention"
+          condition: "must_exist"
+    action:
+      description: "Replace std::sync Mutex/RwLock/Condvar/Once with parking_lot equivalents (measure!)"
+      change_type: "compound"
+      steps:
+        - "cargo add parking_lot"
+        - "type substitution + .lock() API adjustment (parking_lot returns guard directly, no Result)"
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+    notes: |
+      Per book: 'the standard library versions have greatly improved... measure before
+      switching.' If no contention benchmark exists, do not apply.
+
+  # ===========================================================================
+  # GROUP: Iterators
+  # https://nnethercote.github.io/perf-book/iterators.html
+  # ===========================================================================
+
+  - id: "iter_avoid_collect_then_iterate"
+    source_chapter: "Iterators"
+    source_url: "https://nnethercote.github.io/perf-book/iterators.html#collect-and-extend"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        EXPR.collect::<Vec<_>>().iter() | .into_iter()
+        WHERE the intermediate Vec is not stored, returned, or used for len/index
+    action:
+      description: "Remove .collect::<Vec<_>>() — chain iterators directly"
+      change_type: "ast_modification"
+      diff_template: |
+        -src.iter().map(f).collect::<Vec<_>>().iter().for_each(g)
+        +src.iter().map(f).for_each(g)
+    verify: { method: "dhat + criterion", dimensions: ["allocations", "latency_p50"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "iter_return_impl_iterator_over_vec"
+    source_chapter: "Iterators"
+    source_url: "https://nnethercote.github.io/perf-book/iterators.html#collect-and-extend"
+    detect:
+      method: "compound"
+      checks:
+        - method: "ast_pattern"
+          pattern: "fn ...(...) -> Vec<T> { ... .collect() }"
+        - method: "callsite_analysis"
+          condition: "all known callsites only iterate the returned Vec"
+    action:
+      description: "Change return type from Vec<T> to impl Iterator<Item = T>"
+      change_type: "ast_modification"
+      diff_template: |
+        -fn foo(x: &X) -> Vec<T> { x.parts.iter().map(...).collect() }
+        +fn foo(x: &X) -> impl Iterator<Item = T> + '_ { x.parts.iter().map(...) }
+    verify: { method: "dhat + criterion", dimensions: ["allocations", "latency_p50"] }
+    targets: ["allocations", "latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+    notes: "May require lifetime annotation on return type. Refuse if pub API."
+
+  - id: "iter_filter_map_fusion"
+    source_chapter: "Iterators"
+    source_url: "https://nnethercote.github.io/perf-book/iterators.html#chaining"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        .filter(|x| pred(x)).map(|x| f(x))
+        WHERE pred and f operate on the same captured form of x
+        AND fusion into a single Option-returning closure is straightforward
+    action:
+      description: "Fuse .filter(pred).map(f) into .filter_map(|x| if pred(&x) { Some(f(x)) } else { None })"
+      change_type: "ast_modification"
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: ["readability"]
+
+  - id: "iter_chunks_exact_when_divisible"
+    source_chapter: "Iterators"
+    source_url: "https://nnethercote.github.io/perf-book/iterators.html#chunks"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        slice.chunks(N) | slice.chunks_mut(N)
+        WHERE slice.len() % N == 0 is provable from context (asserted, computed, or invariant)
+    action:
+      description: "Replace .chunks(N) with .chunks_exact(N) (and chunks_mut→chunks_exact_mut)"
+      change_type: "ast_modification"
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+
+  - id: "iter_copied_for_small_copy_types"
+    source_chapter: "Iterators"
+    source_url: "https://nnethercote.github.io/perf-book/iterators.html#copied"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        slice.iter() on &[T] where T: Copy and size_of::<T>() <= 8
+        AND downstream consumer takes T by value (not by ref)
+    action:
+      description: "Add .copied() after .iter()"
+      change_type: "ast_modification"
+    verify:
+      method: "compound"
+      checks:
+        - method: "criterion"
+        - method: "asm_diff_check"
+          tool: "cargo-show-asm"
+          condition: "generated code measurably different on hot fn"
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs: []
+    notes: "Per book: 'an advanced technique. You might need to check generated machine code.'"
+
+  - id: "iter_implement_size_hint"
+    source_chapter: "Iterators"
+    source_url: "https://nnethercote.github.io/perf-book/iterators.html#collect-and-extend"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        impl Iterator for T { ... }
+        WHERE size_hint method is not overridden
+        AND T's iteration cardinality is known or bounded
+    action:
+      description: "Add size_hint(&self) -> (usize, Option<usize>) implementation"
+      change_type: "ast_modification"
+    verify: { method: "criterion + dhat", dimensions: ["latency_p50", "allocations"] }
+    targets: ["latency_p50", "allocations"]
+    confidence: "medium"
+    tradeoffs: []
+
+  # ===========================================================================
+  # GROUP: Bounds Checks
+  # https://nnethercote.github.io/perf-book/bounds-checks.html
+  # ===========================================================================
+
+  - id: "bounds_indexed_loop_to_iterator"
+    source_chapter: "Bounds Checks"
+    source_url: "https://nnethercote.github.io/perf-book/bounds-checks.html"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        for i in 0..v.len() { ... v[i] ... }
+        WHERE the body only indexes v[i] (no v[i+1], no multi-array correlation by i)
+    action:
+      description: "Rewrite as iterator: `for x in v.iter()` or `for x in &v`"
+      change_type: "ast_modification"
+      diff_template: |
+        -for i in 0..v.len() {
+        -    process(v[i]);
+        -}
+        +for x in &v {
+        +    process(*x);
+        +}
+    verify:
+      method: "compound"
+      checks:
+        - method: "criterion"
+        - method: "asm_diff_check"
+          condition: "bounds_check_instructions decreased"
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "bounds_slice_lift_out_of_loop"
+    source_chapter: "Bounds Checks"
+    source_url: "https://nnethercote.github.io/perf-book/bounds-checks.html"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        Repeated indexed access vec[i] inside hot loop where vec is a Vec<T> (not a slice)
+    action:
+      description: "Bind slice = &vec[..] (or &vec[lo..hi]) before the loop and index via slice"
+      change_type: "ast_modification"
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: []
+
+  # ===========================================================================
+  # GROUP: I/O
+  # https://nnethercote.github.io/perf-book/io.html
+  # ===========================================================================
+
+  - id: "io_lock_stdout_in_hot_loop"
+    source_chapter: "I/O"
+    source_url: "https://nnethercote.github.io/perf-book/io.html#locking"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        loop { ... println!(...) | print!(...) | eprintln!(...) | eprint!(...) ... }
+        WHERE loop body has more than ~3 iterations on hot path
+    action:
+      description: "Lock stdout (or stderr) outside the loop; use writeln!/write! into the lock"
+      change_type: "ast_modification"
+      diff_template: |
+        -for line in lines {
+        -    println!("{}", line);
+        -}
+        +use std::io::Write;
+        +let stdout = std::io::stdout();
+        +let mut lock = stdout.lock();
+        +for line in lines {
+        +    writeln!(lock, "{}", line)?;
+        +}
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: ["error_handling_surface"]   # introduces a Result that must be handled
+
+  - id: "io_wrap_file_writer_in_bufwriter"
+    source_chapter: "I/O"
+    source_url: "https://nnethercote.github.io/perf-book/io.html#buffering"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        let f = std::fs::File::create(...)?  | File::open with write
+        FOLLOWED BY repeated writeln!/write!/Write::write calls
+        WHERE f is not already wrapped in BufWriter
+    action:
+      description: "Wrap the File in BufWriter::new; add explicit out.flush()? before drop"
+      change_type: "ast_modification"
+      diff_template: |
+        -let mut out = std::fs::File::create(path)?;
+        +let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        ...
+        +out.flush()?;
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "io_wrap_file_reader_in_bufreader"
+    source_chapter: "I/O"
+    source_url: "https://nnethercote.github.io/perf-book/io.html#buffering"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        let f = std::fs::File::open(...)?
+        FOLLOWED BY many small Read::read / Read::read_exact calls
+        WHERE f is not already wrapped in BufReader
+    action:
+      description: "Wrap the File in BufReader::new"
+      change_type: "ast_modification"
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "io_raw_bytes_when_no_utf8_needed"
+    source_chapter: "I/O"
+    source_url: "https://nnethercote.github.io/perf-book/io.html#reading-input-as-raw-bytes"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        BufRead::read_line(&mut String) loop
+        WHERE all operations on the line are byte-level (ASCII-only or treats bytes as bytes)
+    action:
+      description: "Switch to BufRead::read_until(b'\\n', &mut Vec<u8>)"
+      change_type: "ast_modification"
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs: ["semantics"]
+    requires_human_consent: true
+    notes: "Semantics change: no UTF-8 validation. Confirm with operator."
+
+  # ===========================================================================
+  # GROUP: Logging and Debugging
+  # https://nnethercote.github.io/perf-book/logging-and-debugging.html
+  # ===========================================================================
+
+  - id: "log_guard_expensive_log_args"
+    source_chapter: "Logging and Debugging"
+    source_url: "https://nnethercote.github.io/perf-book/logging-and-debugging.html"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        log::{debug,trace,info}!(...EXPR...) | tracing::{debug,trace,info}!(...EXPR...)
+        WHERE EXPR contains a function call, .clone(), format!, or allocation
+        AND the log level is below the typical runtime filter
+    action:
+      description: "Wrap the call site with `if log::log_enabled!(Level::Debug) { ... }`"
+      change_type: "ast_modification"
+      diff_template: |
+        -log::debug!("state: {:?}", expensive_snapshot());
+        +if log::log_enabled!(log::Level::Debug) {
+        +    log::debug!("state: {:?}", expensive_snapshot());
+        +}
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "high"
+    tradeoffs: []
+
+  - id: "log_debug_assert_for_hot_non_safety_assert"
+    source_chapter: "Logging and Debugging"
+    source_url: "https://nnethercote.github.io/perf-book/logging-and-debugging.html"
+    detect:
+      method: "ast_pattern"
+      pattern: |
+        assert!(...) | assert_eq!(...) | assert_ne!(...)
+        WHERE this assertion is on a hot path
+        AND the assertion is documented or marked as "internal invariant, not safety-critical"
+    action:
+      description: "Change `assert*!` to `debug_assert*!`"
+      change_type: "ast_modification"
+    verify: { method: "criterion + tests pass in both dev and release", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "medium"
+    tradeoffs: ["correctness_risk"]   # release-mode invariant disappears
+    requires_human_consent: true
+    notes: |
+      DANGER: assertions that catch UB precursors must stay assert!. Always
+      surface to operator. Per book example PRs in rustc, this is valid only
+      when the assertion is non-safety-critical.
+
+  # ===========================================================================
+  # GROUP: Wrapper Types
+  # https://nnethercote.github.io/perf-book/wrapper-types.html
+  # ===========================================================================
+
+  - id: "wrap_combine_co_accessed_mutexes"
+    source_chapter: "Wrapper Types"
+    source_url: "https://nnethercote.github.io/perf-book/wrapper-types.html"
+    detect:
+      method: "compound"
+      checks:
+        - method: "ast_pattern"
+          pattern: |
+            struct S {
+                a: Mutex<A> | Arc<Mutex<A>> | RefCell<A>,
+                b: Mutex<B> | Arc<Mutex<B>> | RefCell<B>,
+                ...
+            }
+        - method: "access_pattern_analysis"
+          condition: |
+            >80% of methods that touch self.a also touch self.b
+            AND no method touches one without lock-holding the other
+    action:
+      description: "Merge co-accessed wrapped fields into a single wrapper around a tuple/struct"
+      change_type: "ast_modification"
+      diff_template: |
+        -struct S { a: Mutex<A>, b: Mutex<B> }
+        +struct S { ab: Mutex<(A, B)> }
+    verify: { method: "criterion", dimensions: ["latency_p50"] }
+    targets: ["latency_p50"]
+    confidence: "low"
+    tradeoffs: ["api_surface", "lock_granularity"]
+    requires_human_consent: true
+    notes: |
+      Lock-granularity change is architectural. Surface always. Per book:
+      'whether this helps performance will depend on the exact access patterns.'
+
+  # ===========================================================================
+  # GROUP: Compile Times
+  # https://nnethercote.github.io/perf-book/compile-times.html
+  # ===========================================================================
+
+  - id: "compile_factor_non_generic_inner_fn"
+    source_chapter: "Compile Times"
+    source_url: "https://nnethercote.github.io/perf-book/compile-times.html#llvm-ir"
+    detect:
+      method: "compound"
+      checks:
+        - method: "cargo_llvm_lines"
+          command: "cargo llvm-lines --release"
+          parser: "llvm_lines_table"
+          condition: "function ranks in top 20 by IR lines AND is generic"
+        - method: "ast_inspection"
+          condition: "function body contains substantial non-generic code"
+    action:
+      description: "Extract non-generic body into inner fn, call from generic outer fn (per std::fs::read pattern)"
+      change_type: "ast_modification"
+      diff_template: |
+        -pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+        -    let mut file = File::open(path.as_ref())?;
+        -    // ... lots of code using `file` only ...
+        -}
+        +pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+        +    fn inner(path: &Path) -> io::Result<Vec<u8>> {
+        +        let mut file = File::open(path)?;
+        +        // ... lots of code using `file` only ...
+        +    }
+        +    inner(path.as_ref())
+        +}
+    verify:
+      method: "compound"
+      checks:
+        - method: "cargo_llvm_lines"
+          condition: "IR lines for this function decreased"
+        - method: "compile_time_measurement"
+    targets: ["compile_time", "binary_size"]
+    confidence: "medium"
+    tradeoffs: []
+
+  - id: "compile_macro_stats_report"
+    source_chapter: "Compile Times"
+    source_url: "https://nnethercote.github.io/perf-book/compile-times.html#macros"
+    detect:
+      method: "rustc_macro_stats"
+      command: "RUSTFLAGS=\"-Zmacro-stats\" cargo +nightly build --release 2>&1"
+      parser: "macro_stats"
+      filter: "macros generating > 5000 lines of expanded code, ranked descending"
+    action:
+      description: "Report top macro expanders to operator; do not auto-rewrite"
+      change_type: "report_only"
+    verify: { method: "tautological_after_apply" }
+    targets: []
+    confidence: "low"
+    tradeoffs: []
+    notes: "Per book: macro replacement is judgment-heavy. YAML surfaces, does not act."
+
+# -----------------------------------------------------------------------------
+# §5 WORKFLOW — how techniques are applied
+# -----------------------------------------------------------------------------
+
+workflow:
+
+  pre_flight:
+    - step: "read_methodology_substrate"
+      reads:
+        - "*BIBLE*.md"
+        - "docs/architecture/*.md"
+        - "docs/adr/*.md"
+        - "CLAUDE.md"
+        - "AGENTS.md"
+      purpose: "absorb invariants and project-specific constraints into operating context"
+
+    - step: "verify_baseline_green"
+      runs:
+        - contracts.tests
+        - contracts.behavior
+      on_failure: "abort_with_message:baseline not green — fix tests before optimizing"
+
+    - step: "capture_baseline"
+      measures: dimensions   # all of them
+      writes: ".transmute/baselines/baseline.json"
+
+    - step: "identify_hot_paths"
+      strategy:
+        primary:
+          tool: "cargo flamegraph"
+          command: "cargo flamegraph --release --bin {entrypoint}"
+          parser: "folded_stack"
+          threshold_percent: 1.0
+        fallback:
+          tool: "samply"
+          command: "samply record cargo run --release --bin {entrypoint}"
+        if_neither_available:
+          action: "warn_and_set_hot_path_to_all"
+          confidence_penalty: "downgrade all techniques with context_filter:hot_path to medium"
+      writes: ".transmute/profile/hot_paths.json"
+
+    - step: "identify_alloc_hotspots"
+      tool: "dhat"
+      requires: "binary built with dhat-heap feature"
+      writes: ".transmute/profile/alloc_hotspots.json"
+      optional_if_no_dhat_target: true
+
+    - step: "snapshot_type_sizes"
+      tool: "rustc -Zprint-type-sizes"
+      writes: ".transmute/profile/type_sizes.json"
+      requires_nightly: true
+      optional: true
+
+  iteration:
+    max_iterations: 50
+    bounded_by: safety.max_wall_clock
+
+    convergence:
+      rolling_window: 3
+      composite_threshold: 0.005   # tied to composite_scoring.improvement_threshold
+      action_on_convergence: "terminate_with_summary"
+
+    per_iteration:
+
+      - step: "select_technique_instance"
+        from: "techniques"
+        prioritize_by:
+          # Sort order: higher first.
+          - "hot_path_overlap"          # technique applies to detected hot path
+          - "confidence"                # high > medium > low
+          - "target_dimension_weight"   # techniques targeting heavier dimensions
+          - "estimated_blast_radius"    # smaller = sooner (single function < module < workspace)
+        exclude:
+          - "techniques marked once_only that have already been applied"
+          - "techniques that previously failed validation on this instance"
+        instance_granularity: "one_technique_one_site_per_iteration"
+        rationale: |
+          Per bible §8 Q1: granularity is (technique, instance) pair.
+          This keeps each iteration's diff small and reviewable, and lets
+          us measure marginal contribution of each rewrite.
+
+      - step: "conflict_check"
+        rule: |
+          Refuse the proposed change if any line/span in the diff overlaps with
+          a previously-applied technique in this run. Record the conflict and
+          select the next candidate.
+        rationale: "Resolves bible §8 Q2"
+
+      - step: "consent_check"
+        rule: |
+          If technique.requires_human_consent == true, halt and surface a structured
+          prompt: technique id, source URL, proposed diff, tradeoff fields.
+          Wait for explicit approval before applying.
+
+      - step: "apply_change"
+        following: "selected_technique.action"
+        scope: "single_function_or_module_or_cargo_toml_edit"
+        records: ".transmute/iterations/{n}/diff.patch"
+
+      - step: "validate_contracts"
+        in_order:
+          - run: contracts.tests
+            on_failure: "discard_rewrite_and_mark_instance_failed"
+          - run: contracts.behavior
+            on_failure: "discard_rewrite_and_mark_instance_failed"
+          - run: contracts.invariants
+            on_failure: "discard_rewrite_and_mark_instance_failed"
+          - run: contracts.benchmarks
+            on_failure: "discard_rewrite_if_regression_exceeds_tolerance"
+
+      - step: "measure_dimensions"
+        runs: dimensions   # subset listed in technique.targets, plus tradeoff dimensions
+        writes: ".transmute/iterations/{n}/measurements.json"
+
+      - step: "compute_delta_and_composite"
+        method: composite_scoring.method
+        writes: ".transmute/iterations/{n}/delta.json"
+
+      - step: "commit_or_discard"
+        decision:
+          commit_if:
+            - "composite_delta >= composite_scoring.improvement_threshold"
+            - "AND no per-dim regression > regression_tolerance_per_dim"
+          else: "discard_rewrite, mark instance as ineffective for this technique"
+        on_commit:
+          - "git commit -m '{technique.id}: {summary}'"
+          - "increment_convergence_window if composite_delta < threshold"
+          - "reset convergence_window if composite_delta >= threshold"
+
+  termination:
+    triggers:
+      - "max_iterations_reached"
+      - "rolling_window_below_threshold (convergence)"
+      - "wall_clock_budget_exceeded"
+      - "token_budget_exceeded"
+      - "human_halt_command"
+
+    on_terminate:
+      - "compute_run_summary"   # cumulative deltas across committed iterations
+      - "push_to_branch: transmute/run-{timestamp}"
+      - "require_manual_merge: true"
+      - "open_pull_request"
+    pull_request:
+      title_template: "Transmute optimization: {committed_iterations} iterations, {composite_improvement}"
+      body_template: |
+        # Transmute Optimization Run
+
+        **Run id:** {run_id}
+        **Iterations committed:** {committed_iterations} / {max_iterations}
+        **Composite improvement:** {composite_improvement}
+
+        ## Per-dimension delta vs baseline
+        {per_dim_delta_table}
+
+        ## Techniques applied (in order)
+        {technique_log}
+
+        Each entry links to the book chapter that justifies the change and
+        the iteration's measurement record under `.transmute/iterations/N/`.
+
+        ## Discarded rewrites
+        {discarded_log}
+
+        ## Recommended human review
+        - Techniques marked `requires_human_consent` (already gated, but verify)
+        - Rewrites with composite_delta < 1% (small wins; confirm worth the diff)
+        - Any tradeoff dimensions that regressed within tolerance
+
+# -----------------------------------------------------------------------------
+# §6 SAFETY — bounds and escape hatches
+# -----------------------------------------------------------------------------
+
+safety:
+  max_wall_clock: "8h"
+  max_token_budget: "10M"
+  max_files_modified_per_iteration: 5
+  max_lines_changed_per_iteration: 200
+  branch_protection_required: true
+  human_review_required: true   # final merge always human
+  abort_if_consecutive_failures: 5
+  preserve_original_branch: true
+
+  halt_on:
+    - "any test failure in baseline (before iteration 1)"
+    - "two consecutive iterations breaking the same contract"
+    - "human_halt_command"
+
+  forbidden_changes:
+    - "no introduction of `unsafe` blocks unless original code had `unsafe` in the same module"
+    - "no edits to LICENSE, COPYING, SECURITY.md, NOTICE"
+    - "no edits to CI configuration (.github/, .gitlab/, ci/) unless technique = bc_faster_linker_lld"
+    - "no edits outside the workspace root"
+
+# -----------------------------------------------------------------------------
+# §7 PROVENANCE — what this spec is and is not
+# -----------------------------------------------------------------------------
+
+provenance:
+  source_book: "The Rust Performance Book"
+  source_author: "Nicholas Nethercote"
+  source_url: "https://nnethercote.github.io/perf-book/"
+  rule: |
+    Every technique above traces to a section of the book identified by
+    source_chapter + source_url. No novel optimization claims appear. If a
+    technique seems valuable but cannot be traced to the book, it does not
+    belong in this YAML — surface it to the operator instead.
+
+  scope_excluded:
+    - chapter: "Benchmarking"
+      reason: "methodology, not technique — encoded in contracts.benchmarks"
+    - chapter: "Profiling"
+      reason: "methodology, not technique — encoded in workflow.pre_flight"
+    - chapter: "Machine Code"
+      reason: "exploratory; ASM inspection requires human judgment"
+    - chapter: "Parallelism"
+      reason: "architectural redesign; outside operationalization criteria"
+    - chapter: "General Tips"
+      reason: "heuristics; outside operationalization criteria"
+    - chapter: "Compile Times §Visualization"
+      reason: "reporting only; surface via compile_macro_stats_report"
